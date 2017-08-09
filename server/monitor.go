@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	gnatsd "github.com/nats-io/gnatsd/server"
@@ -18,11 +19,12 @@ import (
 
 // Routes for the monitoring pages
 const (
-	RootPath     = "/streaming"
-	ServerPath   = RootPath + "/serverz"
-	StorePath    = RootPath + "/storez"
-	ClientsPath  = RootPath + "/clientsz"
-	ChannelsPath = RootPath + "/channelsz"
+	RootPath         = "/streaming"
+	ServerPath       = RootPath + "/serverz"
+	StorePath        = RootPath + "/storez"
+	ClientsPath      = RootPath + "/clientsz"
+	ChannelsPath     = RootPath + "/channelsz"
+	RESTChannelsPath = RootPath + "/channelsz/"
 
 	defaultMonitorListLimit = 1024
 )
@@ -135,6 +137,7 @@ func (s *StanServer) startMonitoring(nOpts *gnatsd.Options) error {
 	mux.HandleFunc(StorePath, s.handleStorez)
 	mux.HandleFunc(ClientsPath, s.handleClientsz)
 	mux.HandleFunc(ChannelsPath, s.handleChannelsz)
+	mux.HandleFunc(RESTChannelsPath, s.handleRESTChannelsz)
 
 	return nil
 }
@@ -385,19 +388,16 @@ func (a byChannelName) Less(i, j int) bool { return a[i].Name < a[j].Name }
 
 func (s *StanServer) handleChannelsz(w http.ResponseWriter, r *http.Request) {
 	channelName := r.URL.Query().Get("channel")
-	subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 	if channelName != "" {
-		if r.URL.Query().Get("delete") != "" {
-			s.handleDeleteChannel(w, r, channelName)
-		} else {
-			s.handleOneChannel(w, r, channelName, subsOption)
-		}
+		subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
+		s.handleOneChannel(w, r, channelName, subsOption)
 	} else {
-		s.handleAllChannels(w, r, channelName, subsOption)
+		s.handleAllChannels(w, r)
 	}
 }
 
-func (s *StanServer) handleAllChannels(w http.ResponseWriter, r *http.Request, channelName string, subsOption int) {
+func (s *StanServer) handleAllChannels(w http.ResponseWriter, r *http.Request) {
+	subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 	offset, limit := getOffsetAndLimit(r)
 	channels := s.channels.getAll()
 	totalChannels := len(channels)
@@ -421,7 +421,7 @@ func (s *StanServer) handleAllChannels(w http.ResponseWriter, r *http.Request, c
 		for _, cz := range carr {
 			cs := channels[cz.Name]
 			if err := updateChannelz(cz, cs, subsOption); err != nil {
-				http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", channelName, err), http.StatusInternalServerError)
+				http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", cz.Name, err), http.StatusInternalServerError)
 				return
 			}
 		}
@@ -452,6 +452,31 @@ func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	s.sendResponse(w, r, channelz)
+}
+
+func (s *StanServer) handleRESTChannelsz(w http.ResponseWriter, r *http.Request) {
+	uri := strings.TrimPrefix(r.RequestURI, RESTChannelsPath)
+	routes := strings.Split(uri, "/")
+	channel := routes[0]
+	// Remove possible options from channel name
+	optsPos := strings.Index(channel, "?")
+	if optsPos >= 0 {
+		channel = channel[:optsPos]
+	}
+	switch r.Method {
+	case "DELETE":
+		s.handleDeleteChannel(w, r, channel)
+	case "GET":
+		if channel == "" {
+			s.handleAllChannels(w, r)
+		} else {
+			subsOption := 0
+			if len(routes) > 1 && strings.HasPrefix(routes[1], "subs") {
+				subsOption = 1
+			}
+			s.handleOneChannel(w, r, channel, subsOption)
+		}
+	}
 }
 
 func (s *StanServer) handleDeleteChannel(w http.ResponseWriter, r *http.Request, name string) {
@@ -485,7 +510,8 @@ func (s *StanServer) handleDeleteChannel(w http.ResponseWriter, r *http.Request,
 		http.Error(w, errTxt, httpStatus)
 		return
 	}
-	s.sendResponse(w, r, []byte(fmt.Sprintf("Channel %q has been (or is being) deleted", name)))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Channel %q has been (or is being) deleted", name)))
 }
 
 func updateChannelz(cz *Channelz, c *channel, subsOption int) error {
