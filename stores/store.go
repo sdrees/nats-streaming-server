@@ -23,6 +23,7 @@ var (
 	ErrTooManySubs     = errors.New("too many subscriptions per channel")
 	ErrNotSupported    = errors.New("not supported")
 	ErrAlreadyExists   = errors.New("already exists")
+	ErrNotFound        = errors.New("not found")
 )
 
 // StoreLimits define limits for a store.
@@ -181,6 +182,17 @@ type Store interface {
 	// Limits defined for this channel in StoreLimits.PeChannel map, if present,
 	// will apply. Otherwise, the global limits in StoreLimits will apply.
 	CreateChannel(channel string) (*Channel, error)
+
+	// DeleteChannel deletes a Channel.
+	// Implementations should make sure that if no error is returned, the
+	// channel would not be recovered after a restart, unless CreateChannel()
+	// with the same channel is invoked.
+	// If processing is expecting to be time consuming, work should be done
+	// in the background as long as the above condition is guaranteed.
+	// It is also acceptable for an implementation to have CreateChannel()
+	// return an error if background deletion is still happening for a
+	// channel of the same name.
+	DeleteChannel(channel string) error
 
 	// AddClient stores information about the client identified by `clientID`.
 	AddClient(clientID, hbInbox string) (*Client, error)

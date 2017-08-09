@@ -67,7 +67,7 @@ func (gs *genericStore) init(name string, log logger.Logger, limits *StoreLimits
 	if limits == nil {
 		limits = &DefaultStoreLimits
 	}
-	if err := gs.setLimits(limits); err != nil {
+	if err := gs.setLimitsLocked(limits); err != nil {
 		return err
 	}
 	gs.log = log
@@ -101,7 +101,7 @@ func (gs *genericStore) Recover() (*RecoveredState, error) {
 
 // setLimits makes a copy of the given StoreLimits,
 // validates the limits and if ok, applies the inheritance.
-func (gs *genericStore) setLimits(limits *StoreLimits) error {
+func (gs *genericStore) setLimitsLocked(limits *StoreLimits) error {
 	// Make a copy.
 	gs.limits = limits.Clone()
 	// Build will validate and apply inheritance if no error.
@@ -139,7 +139,7 @@ func (gs *genericStore) getChannelLimits(channel string) *ChannelLimits {
 // SetLimits sets limits for this store
 func (gs *genericStore) SetLimits(limits *StoreLimits) error {
 	gs.Lock()
-	err := gs.setLimits(limits)
+	err := gs.setLimitsLocked(limits)
 	gs.Unlock()
 	return err
 }
@@ -149,10 +149,31 @@ func (gs *genericStore) CreateChannel(channel string) (*Channel, error) {
 	return nil, nil
 }
 
+// DeleteChannel implements the Store interface
+func (gs *genericStore) DeleteChannel(channel string) error {
+	gs.Lock()
+	err := gs.deleteChannelLocked(channel)
+	gs.Unlock()
+	return err
+}
+
+func (gs *genericStore) deleteChannelLocked(channel string) error {
+	c := gs.channels[channel]
+	if c == nil {
+		return ErrNotFound
+	}
+	delete(gs.channels, channel)
+	err := c.Msgs.Close()
+	if lerr := c.Subs.Close(); lerr != nil && err == nil {
+		err = lerr
+	}
+	return err
+}
+
 // canAddChannel returns true if the current number of channels is below the limit.
 // If a channel named `channelName` alreadt exists, an error is returned.
 // Store lock is assumed to be locked.
-func (gs *genericStore) canAddChannel(name string) error {
+func (gs *genericStore) canAddChannelLocked(name string) error {
 	if gs.channels[name] != nil {
 		return ErrAlreadyExists
 	}
@@ -180,11 +201,11 @@ func (gs *genericStore) Close() error {
 		return nil
 	}
 	gs.closed = true
-	return gs.close()
+	return gs.closeLocked()
 }
 
 // close closes all stores. Store lock is assumed held on entry
-func (gs *genericStore) close() error {
+func (gs *genericStore) closeLocked() error {
 	var err error
 	var lerr error
 
@@ -315,7 +336,7 @@ func (gss *genericSubStore) init(channel string, log logger.Logger, limits *SubS
 // by the other SubStore methods.
 func (gss *genericSubStore) CreateSub(sub *spb.SubState) error {
 	gss.Lock()
-	err := gss.createSub(sub)
+	err := gss.createSubLocked(sub)
 	gss.Unlock()
 	return err
 }
@@ -327,7 +348,7 @@ func (gss *genericSubStore) UpdateSub(sub *spb.SubState) error {
 
 // createSub is the unlocked version of CreateSub that can be used by
 // non-generic implementations.
-func (gss *genericSubStore) createSub(sub *spb.SubState) error {
+func (gss *genericSubStore) createSubLocked(sub *spb.SubState) error {
 	if gss.limits.MaxSubscriptions > 0 && gss.subsCount >= gss.limits.MaxSubscriptions {
 		return ErrTooManySubs
 	}

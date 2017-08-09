@@ -1091,3 +1091,13 @@ func TestCSLimitWithWildcardsInConfig(t *testing.T) {
 		stackFatalf(t, "M1 should have been removed")
 	}
 }
+
+func testDeleteChannel(t *testing.T, s Store) {
+	if err := s.DeleteChannel("notfound"); err != ErrNotFound {
+		stackFatalf(t, "Expected %v error, got %v", ErrNotFound, err)
+	}
+	storeCreateChannel(t, s, "foo")
+	if err := s.DeleteChannel("foo"); err != nil {
+		stackFatalf(t, "Error on delete: %v", err)
+	}
+}

@@ -207,3 +207,9 @@ func TestMSNegativeLimits(t *testing.T) {
 
 	testNegativeLimit(t, ms)
 }
+
+func TestMSDeleteChannel(t *testing.T) {
+	ms := createDefaultMemStore(t)
+	defer ms.Close()
+	testDeleteChannel(t, ms)
+}

@@ -51,7 +51,7 @@ func (ms *MemoryStore) CreateChannel(channel string) (*Channel, error) {
 	defer ms.Unlock()
 
 	// Verify that it does not already exist or that we did not hit the limits
-	if err := ms.canAddChannel(channel); err != nil {
+	if err := ms.canAddChannelLocked(channel); err != nil {
 		return nil, err
 	}
 

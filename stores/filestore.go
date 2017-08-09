@@ -1466,7 +1466,7 @@ func (fs *FileStore) CreateChannel(channel string) (*Channel, error) {
 	defer fs.Unlock()
 
 	// Verify that it does not already exist or that we did not hit the limits
-	if err := fs.canAddChannel(channel); err != nil {
+	if err := fs.canAddChannelLocked(channel); err != nil {
 		return nil, err
 	}
 
@@ -1501,6 +1501,17 @@ func (fs *FileStore) CreateChannel(channel string) (*Channel, error) {
 	fs.channels[channel] = c
 
 	return c, nil
+}
+
+// DeleteChannel implements the Store interface
+func (fs *FileStore) DeleteChannel(channel string) error {
+	fs.Lock()
+	defer fs.Unlock()
+	err := fs.genericStore.deleteChannelLocked(channel)
+	if lerr := os.RemoveAll(filepath.Join(fs.fm.rootDir, channel)); lerr != nil && err == nil {
+		err = lerr
+	}
+	return err
 }
 
 // AddClient implements the Store interface
@@ -1655,7 +1666,7 @@ func (fs *FileStore) Close() error {
 	}
 	fs.closed = true
 
-	err := fs.genericStore.close()
+	err := fs.genericStore.closeLocked()
 
 	fm := fs.fm
 	lockFile := fs.lockFile
@@ -3278,7 +3289,7 @@ func (ss *FileSubStore) CreateSub(sub *spb.SubState) error {
 	// subscription count)
 	ss.Lock()
 	defer ss.Unlock()
-	if err := ss.createSub(sub); err != nil {
+	if err := ss.createSubLocked(sub); err != nil {
 		return err
 	}
 	if err := ss.writeRecord(nil, subRecNew, sub); err != nil {

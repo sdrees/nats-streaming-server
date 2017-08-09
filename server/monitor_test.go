@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -1112,5 +1113,192 @@ func TestMonitorDurableSubs(t *testing.T) {
 		dur.Unsubscribe()
 		// There shouldn't be any sub now
 		getAndCheck(false, 0)
+	}
+}
+
+func TestMonitorDeleteChannelNoTLS(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	nOpts := natsdTest.DefaultTestOptions
+	nOpts.HTTPHost = monitorHost
+	// Reject a delete if it is not HTTPS
+	nOpts.HTTPPort = monitorPort
+	s := runServerWithOpts(t, nil, &nOpts)
+	defer s.Shutdown()
+
+	channelsLookupOrCreate(t, s, "foo")
+
+	monitorExpectStatus(t, ChannelsPath+"?channel=foo&delete=1", http.StatusForbidden)
+}
+
+type deleteChannelMockStore struct {
+	sync.Mutex
+	stores.Store
+	beSlow bool
+	doFail bool
+}
+
+func (s *deleteChannelMockStore) DeleteChannel(name string) error {
+	s.Lock()
+	defer s.Unlock()
+	if s.beSlow {
+		time.Sleep(300 * time.Millisecond)
+	} else if s.doFail {
+		return errOnPurpose
+	}
+	return s.Store.DeleteChannel(name)
+}
+
+func TestMonitorDeleteChannel(t *testing.T) {
+	nOpts := natsdTest.DefaultTestOptions
+	nOpts.HTTPHost = monitorHost
+	nOpts.HTTPSPort = monitorPort
+	nOpts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	cert, err := tls.LoadX509KeyPair("../test/certs/server-cert.pem", "../test/certs/server-key.pem")
+	if err != nil {
+		t.Fatalf("Got error reading certificates: %s", err)
+	}
+	nOpts.TLSConfig.Certificates = []tls.Certificate{cert}
+
+	for mode := 0; mode < 2; mode++ {
+		func() {
+			resetPreviousHTTPConnections()
+
+			var sOpts *Options
+			if mode == 0 {
+				sOpts = GetDefaultOptions()
+			} else {
+				cleanupDatastore(t)
+				defer cleanupDatastore(t)
+				sOpts = getTestDefaultOptsForPersistentStore()
+			}
+			sOpts.Secure = true
+
+			sOpts.Partitioning = true
+			sOpts.AddPerChannel("partitioned", &stores.ChannelLimits{})
+			setPartitionsVarsForTest()
+			defer resetDefaultPartitionsVars()
+			s := runServerWithOpts(t, sOpts, &nOpts)
+			defer s.Shutdown()
+
+			tlsConfig := &tls.Config{}
+			caCert, err := ioutil.ReadFile("../test/certs/ca.pem")
+			if err != nil {
+				t.Fatalf("Got error reading RootCA file: %s", err)
+			}
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(caCert)
+			tlsConfig.RootCAs = caCertPool
+			transport := &http.Transport{TLSClientConfig: tlsConfig}
+			httpClient := &http.Client{Transport: transport}
+
+			// Not allowed with Partitioning
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=partitioned&delete=1", http.StatusForbidden)
+			s.Shutdown()
+
+			// Restart server without partitioning for the rest of the tests
+			sOpts.Partitioning = false
+			sOpts.PerChannel = nil
+			s = runServerWithOpts(t, sOpts, &nOpts)
+			defer s.Shutdown()
+
+			// Channel not found
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=foo&delete=1", http.StatusNotFound)
+
+			sc, nc := createConnectionWithNatsOpts(t, clientName, nats.Secure(nil))
+			defer nc.Close()
+			defer sc.Close()
+
+			if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 1)
+
+			// Has subs, so forbidden
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=foo&delete=1", http.StatusForbidden)
+
+			// Try with various type of subscriptions
+			if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}, stan.DurableName("dur")); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 2)
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=bar&delete=1", http.StatusForbidden)
+
+			if _, err := sc.QueueSubscribe("baz", "queue", func(_ *stan.Msg) {}); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 3)
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=baz&delete=1", http.StatusForbidden)
+
+			if _, err := sc.QueueSubscribe("bozo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur")); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 4)
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=bozo&delete=1", http.StatusForbidden)
+
+			// Create channel without subs
+			channelsLookupOrCreate(t, s, "deleteok")
+			// Delete and expect no error
+			getBodyEx(t, httpClient, "https", ChannelsPath+"?channel=deleteok&delete=1", http.StatusOK, expectedJSON)
+			// Make sure it has been removed
+			if c := s.channels.get("deleteok"); c != nil {
+				t.Fatalf("Channel should have been deleted, got %v", c)
+			}
+			sc.Close()
+			nc.Close()
+
+			// Force timeout
+			channelsLookupOrCreate(t, s, "deletetimeout")
+			deleteChannelTimeout = 250 * time.Millisecond
+			defer func() { deleteChannelTimeout = defaultDeleteChannelTimeout }()
+			s.channels.Lock()
+			ms := &deleteChannelMockStore{Store: s.channels.store}
+			s.channels.store = ms
+			s.channels.Unlock()
+			ms.Lock()
+			ms.beSlow = true
+			ms.Unlock()
+			// Delete and expect timeout error
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=deletetimeout&delete=1", http.StatusRequestTimeout)
+			// The channel should still have been removed.
+			// Need to wait for store to finish
+			var c *channel
+			for i := 0; i < 20; i++ {
+				c = s.channels.get("deletetimeout")
+				if c == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if c != nil {
+				t.Fatal("Channel should have been removed")
+			}
+
+			// Force store error
+			ms.Lock()
+			ms.beSlow = false
+			ms.doFail = true
+			ms.Unlock()
+			channelsLookupOrCreate(t, s, "storeerror")
+			// Delete and expect internal server error
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=storeerror&delete=1", http.StatusInternalServerError)
+
+			// Force NATS errors
+			channelsLookupOrCreate(t, s, "natserror")
+			s.nc.Close()
+			// Delete and expect internal server error
+			monitorExpectStatusEx(t, httpClient, "https", ChannelsPath+"?channel=natserror&delete=1", http.StatusInternalServerError)
+
+			if mode == 1 {
+				// Persistence mode, try to restart the server and ensure channel is not recovered
+				s.Shutdown()
+				resetPreviousHTTPConnections()
+				s = runServerWithOpts(t, sOpts, &nOpts)
+				if c := s.channels.get("deleteok"); c != nil {
+					t.Fatalf("Channel should not exist after a server restart, got %v", c)
+				}
+				defer s.Shutdown()
+			}
+		}()
 	}
 }

@@ -387,49 +387,57 @@ func (s *StanServer) handleChannelsz(w http.ResponseWriter, r *http.Request) {
 	channelName := r.URL.Query().Get("channel")
 	subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 	if channelName != "" {
-		s.handleOneChannel(w, r, channelName, subsOption)
-	} else {
-		offset, limit := getOffsetAndLimit(r)
-		channels := s.channels.getAll()
-		totalChannels := len(channels)
-		minoff, maxoff := getMinMaxOffset(offset, limit, totalChannels)
-		channelsz := &Channelsz{
-			ClusterID: s.info.ClusterID,
-			ServerID:  s.serverID,
-			Now:       time.Now(),
-			Offset:    offset,
-			Limit:     limit,
-			Total:     totalChannels,
-		}
-		if subsOption == 1 {
-			carr := make([]*Channelz, 0, totalChannels)
-			for cn := range channels {
-				cz := &Channelz{Name: cn}
-				carr = append(carr, cz)
-			}
-			sort.Sort(byChannelName(carr))
-			carr = carr[minoff:maxoff]
-			for _, cz := range carr {
-				cs := channels[cz.Name]
-				if err := updateChannelz(cz, cs, subsOption); err != nil {
-					http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", channelName, err), http.StatusInternalServerError)
-					return
-				}
-			}
-			channelsz.Count = len(carr)
-			channelsz.Channels = carr
+		if r.URL.Query().Get("delete") != "" {
+			s.handleDeleteChannel(w, r, channelName)
 		} else {
-			carr := make([]string, 0, totalChannels)
-			for cn := range channels {
-				carr = append(carr, cn)
-			}
-			sort.Sort(byName(carr))
-			carr = carr[minoff:maxoff]
-			channelsz.Count = len(carr)
-			channelsz.Names = carr
+			s.handleOneChannel(w, r, channelName, subsOption)
 		}
-		s.sendResponse(w, r, channelsz)
+	} else {
+		s.handleAllChannels(w, r, channelName, subsOption)
 	}
+}
+
+func (s *StanServer) handleAllChannels(w http.ResponseWriter, r *http.Request, channelName string, subsOption int) {
+	offset, limit := getOffsetAndLimit(r)
+	channels := s.channels.getAll()
+	totalChannels := len(channels)
+	minoff, maxoff := getMinMaxOffset(offset, limit, totalChannels)
+	channelsz := &Channelsz{
+		ClusterID: s.info.ClusterID,
+		ServerID:  s.serverID,
+		Now:       time.Now(),
+		Offset:    offset,
+		Limit:     limit,
+		Total:     totalChannels,
+	}
+	if subsOption == 1 {
+		carr := make([]*Channelz, 0, totalChannels)
+		for cn := range channels {
+			cz := &Channelz{Name: cn}
+			carr = append(carr, cz)
+		}
+		sort.Sort(byChannelName(carr))
+		carr = carr[minoff:maxoff]
+		for _, cz := range carr {
+			cs := channels[cz.Name]
+			if err := updateChannelz(cz, cs, subsOption); err != nil {
+				http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", channelName, err), http.StatusInternalServerError)
+				return
+			}
+		}
+		channelsz.Count = len(carr)
+		channelsz.Channels = carr
+	} else {
+		carr := make([]string, 0, totalChannels)
+		for cn := range channels {
+			carr = append(carr, cn)
+		}
+		sort.Sort(byName(carr))
+		carr = carr[minoff:maxoff]
+		channelsz.Count = len(carr)
+		channelsz.Names = carr
+	}
+	s.sendResponse(w, r, channelsz)
 }
 
 func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, name string, subsOption int) {
@@ -444,6 +452,40 @@ func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	s.sendResponse(w, r, channelz)
+}
+
+func (s *StanServer) handleDeleteChannel(w http.ResponseWriter, r *http.Request, name string) {
+	if r.TLS == nil {
+		http.Error(w, "Channels can be deleted only through HTTPS", http.StatusForbidden)
+		return
+	}
+	// Consider ErrChannelIsBeingDeleted OK
+	if err := s.deleteChannel(name); err != nil && err != ErrChannelIsBeingDeleted {
+		var (
+			httpStatus int
+			errTxt     string
+		)
+		switch err {
+		case ErrChannelNotFound:
+			errTxt = fmt.Sprintf("Channel %q not found", name)
+			httpStatus = http.StatusNotFound
+		case ErrOperationTimeout:
+			httpStatus = http.StatusRequestTimeout
+			errTxt = fmt.Sprintf("Channel %q may have not been deleted: %v", name, err)
+		case ErrChannelHasSubscriptions:
+			fallthrough
+		case ErrNotPermittedInPartitioningMode:
+			httpStatus = http.StatusForbidden
+		default:
+			httpStatus = http.StatusInternalServerError
+		}
+		if errTxt == "" {
+			errTxt = fmt.Sprintf("Channel %q cannot be deleted: %v", name, err)
+		}
+		http.Error(w, errTxt, httpStatus)
+		return
+	}
+	s.sendResponse(w, r, []byte(fmt.Sprintf("Channel %q has been (or is being) deleted", name)))
 }
 
 func updateChannelz(cz *Channelz, c *channel, subsOption int) error {

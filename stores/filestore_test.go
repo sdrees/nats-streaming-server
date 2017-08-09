@@ -2004,3 +2004,21 @@ func TestFSParallelRecovery(t *testing.T) {
 		t.Fatalf("Too many go routines left: %v", left)
 	}
 }
+
+func TestFSDeleteChannel(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	fs := createDefaultFileStore(t)
+	defer fs.Close()
+
+	testDeleteChannel(t, fs)
+
+	// Restart the server and ensure channel "foo" is not reconvered
+	fs.Close()
+	fs, state := openDefaultFileStore(t)
+	defer fs.Close()
+	if state != nil && len(state.Channels) > 0 {
+		t.Fatal("Channel recovered after restart")
+	}
+}
