@@ -1,4 +1,15 @@
-// Copyright 2016 Apcera Inc. All rights reserved.
+// Copyright 2016-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
@@ -143,6 +154,11 @@ func (sl *StoreLimits) inheritLimits(channel *channelLimitInfo, parentLimits *Ch
 	} else if cl.MaxAge == 0 {
 		cl.MaxAge = parentLimits.MaxAge
 	}
+	if cl.MaxInactivity < 0 {
+		cl.MaxInactivity = 0
+	} else if cl.MaxInactivity == 0 {
+		cl.MaxInactivity = parentLimits.MaxInactivity
+	}
 	channel.isProcessed = true
 }
 
@@ -161,6 +177,9 @@ func (sl *StoreLimits) checkGlobalLimits() error {
 	}
 	if sl.MaxAge < 0 {
 		return fmt.Errorf("max age limit cannot be negative (%v)", sl.MaxAge)
+	}
+	if sl.MaxInactivity < 0 {
+		return fmt.Errorf("max inactivity limit cannot be negative (%v)", sl.MaxInactivity)
 	}
 	return nil
 }
@@ -252,11 +271,13 @@ func getGlobalLimitsPrintLines(limits *ChannelLimits) []string {
 	defMaxMsgs := int64(defaultLimits.MaxMsgs)
 	defMaxBytes := defaultLimits.MaxBytes
 	defMaxAge := defaultLimits.MaxAge
+	defMaxInactivity := defaultLimits.MaxInactivity
 	txt := []string{}
 	txt = append(txt, fmt.Sprintf("  Subscriptions: %s", getLimitStr(true, int64(limits.MaxSubscriptions), defMaxSubs, limitCount)))
 	txt = append(txt, fmt.Sprintf("  Messages     : %s", getLimitStr(true, int64(limits.MaxMsgs), defMaxMsgs, limitCount)))
 	txt = append(txt, fmt.Sprintf("  Bytes        : %s", getLimitStr(true, limits.MaxBytes, defMaxBytes, limitBytes)))
 	txt = append(txt, fmt.Sprintf("  Age          : %s", getLimitStr(true, int64(limits.MaxAge), int64(defMaxAge), limitDuration)))
+	txt = append(txt, fmt.Sprintf("  Inactivity   : %s", getLimitStr(true, int64(limits.MaxInactivity), int64(defMaxInactivity), limitDuration)))
 	return txt
 }
 
@@ -265,10 +286,12 @@ func getChannelLimitsPrintLines(level, maxLevels int, maxLen *int, channelName s
 	plMaxMsgs := int64(parentLimits.MaxMsgs)
 	plMaxBytes := parentLimits.MaxBytes
 	plMaxAge := parentLimits.MaxAge
+	plMaxInactivity := parentLimits.MaxInactivity
 	maxSubsOverride := getLimitStr(false, int64(limits.MaxSubscriptions), plMaxSubs, limitCount)
 	maxMsgsOverride := getLimitStr(false, int64(limits.MaxMsgs), plMaxMsgs, limitCount)
 	maxBytesOverride := getLimitStr(false, limits.MaxBytes, plMaxBytes, limitBytes)
 	maxAgeOverride := getLimitStr(false, int64(limits.MaxAge), int64(plMaxAge), limitDuration)
+	MaxInactivityOverride := getLimitStr(false, int64(limits.MaxInactivity), int64(plMaxInactivity), limitDuration)
 	paddingLeft := repeatChar(" ", level)
 	paddingRight := repeatChar(" ", maxLevels-level)
 	txt := []string{}
@@ -284,6 +307,9 @@ func getChannelLimitsPrintLines(level, maxLevels int, maxLen *int, channelName s
 	}
 	if maxAgeOverride != "" {
 		txt = append(txt, fmt.Sprintf("%s |-> Age           %s%s", paddingLeft, paddingRight, maxAgeOverride))
+	}
+	if MaxInactivityOverride != "" {
+		txt = append(txt, fmt.Sprintf("%s |-> Inactivity    %s%s", paddingLeft, paddingRight, MaxInactivityOverride))
 	}
 	for _, l := range txt {
 		if len(l) > *maxLen {

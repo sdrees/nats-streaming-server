@@ -1,12 +1,26 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
 import (
 	"hash/crc32"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,8 +29,8 @@ import (
 )
 
 func TestFSBadSubFile(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	// Create a valid store file first
 	fs := createDefaultFileStore(t)
@@ -29,7 +43,7 @@ func TestFSBadSubFile(t *testing.T) {
 	fs.Close()
 
 	// First delete the file...
-	fileName := filepath.Join(defaultDataStore, "foo", subsFileName)
+	fileName := filepath.Join(testFSDefaultDatastore, "foo", subsFileName)
 	if err := os.Remove(fileName); err != nil {
 		t.Fatalf("Unable to delete the subscriptions file %q: %v", fileName, err)
 	}
@@ -114,8 +128,8 @@ func checkSubStoreRecCounts(t *testing.T, s *FileSubStore, expectedSubs, expecte
 }
 
 func TestFSCompactSubsFileOnDelete(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	fs := createDefaultFileStore(t)
 	defer fs.Close()
@@ -211,7 +225,7 @@ func TestFSCompactSubsFileOnDelete(t *testing.T) {
 
 	fs.Close()
 	// Wipe-out everything
-	cleanupDatastore(t)
+	cleanupFSDatastore(t)
 
 	fs = createDefaultFileStore(t)
 	defer fs.Close()
@@ -240,7 +254,7 @@ func TestFSCompactSubsFileOnDelete(t *testing.T) {
 
 	fs.Close()
 	// Wipe-out everything
-	cleanupDatastore(t)
+	cleanupFSDatastore(t)
 
 	fs = createDefaultFileStore(t)
 	defer fs.Close()
@@ -271,8 +285,8 @@ func TestFSCompactSubsFileOnDelete(t *testing.T) {
 }
 
 func TestFSCompactSubsFileOnAck(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	fs := createDefaultFileStore(t)
 	defer fs.Close()
@@ -413,7 +427,7 @@ func TestFSCompactSubsFileOnAck(t *testing.T) {
 
 	fs.Close()
 	// Wipe-out everything
-	cleanupDatastore(t)
+	cleanupFSDatastore(t)
 
 	fs = createDefaultFileStore(t)
 	defer fs.Close()
@@ -446,7 +460,7 @@ func TestFSCompactSubsFileOnAck(t *testing.T) {
 
 	fs.Close()
 	// Wipe-out everything
-	cleanupDatastore(t)
+	cleanupFSDatastore(t)
 
 	fs = createDefaultFileStore(t)
 	defer fs.Close()
@@ -481,8 +495,8 @@ func TestFSCompactSubsFileOnAck(t *testing.T) {
 }
 
 func TestFSNoReferenceToCallerSubState(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	s := createDefaultFileStore(t)
 	defer s.Close()
@@ -491,8 +505,8 @@ func TestFSNoReferenceToCallerSubState(t *testing.T) {
 	ss := cs.Subs
 	sub := &spb.SubState{
 		ClientID:      "me",
-		Inbox:         nuidGen.Next(),
-		AckInbox:      nuidGen.Next(),
+		Inbox:         "inbox",
+		AckInbox:      "ackinbox",
 		AckWaitInSecs: 10,
 	}
 	if err := ss.CreateSub(sub); err != nil {
@@ -514,8 +528,8 @@ func TestFSNoReferenceToCallerSubState(t *testing.T) {
 }
 
 func TestFSCompactSubsUpdateLastSent(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	s := createDefaultFileStore(t)
 	defer s.Close()
@@ -523,7 +537,7 @@ func TestFSCompactSubsUpdateLastSent(t *testing.T) {
 	cs := storeCreateChannel(t, s, "foo")
 	total := 10
 	for i := 0; i < total; i++ {
-		storeMsg(t, cs, "foo", []byte("hello"))
+		storeMsg(t, cs, "foo", uint64(i+1), []byte("hello"))
 	}
 	expectedLastSent := 5
 	subID := storeSub(t, cs, "foo")
@@ -548,9 +562,13 @@ func TestFSCompactSubsUpdateLastSent(t *testing.T) {
 }
 
 func TestFSSubStoreVariousBufferSizes(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
+	seq := uint64(1)
 	sizes := []int{0, subBufMinShrinkSize - subBufMinShrinkSize/10, subBufMinShrinkSize, 3*subBufMinShrinkSize + subBufMinShrinkSize/2}
 	for _, size := range sizes {
 
@@ -559,7 +577,8 @@ func TestFSSubStoreVariousBufferSizes(t *testing.T) {
 		defer fs.Close()
 
 		cs := storeCreateChannel(t, fs, "foo")
-		m := storeMsg(t, cs, "foo", []byte("hello"))
+		m := storeMsg(t, cs, "foo", seq, []byte("hello"))
+		seq++
 
 		// Perform some activities on subscriptions file
 		subID := storeSub(t, cs, "foo")
@@ -734,13 +753,13 @@ func TestFSSubStoreVariousBufferSizes(t *testing.T) {
 			}
 		}
 		fs.Close()
-		cleanupDatastore(t)
+		cleanupFSDatastore(t)
 	}
 }
 
 func TestFSSubAPIsOnFileErrors(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	// No buffer for this test
 	fs := createDefaultFileStore(t, BufferSize(0))
@@ -765,8 +784,8 @@ func TestFSSubAPIsOnFileErrors(t *testing.T) {
 }
 
 func TestFSCreateSubNotCountedOnError(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
 
 	// No buffer for this test
 	fs := createDefaultFileStore(t, BufferSize(0))
@@ -789,5 +808,119 @@ func TestFSCreateSubNotCountedOnError(t *testing.T) {
 	ss.RUnlock()
 	if lm != 0 {
 		t.Fatalf("Expected subs map to be empty, got %v", lm)
+	}
+}
+
+func TestFSSubscriptionsFileWithExtraZeros(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ss := c.Subs
+	sub1 := &spb.SubState{
+		ClientID:      "me",
+		Inbox:         "inbox",
+		AckInbox:      "ackInbox",
+		AckWaitInSecs: 10,
+	}
+	if err := ss.CreateSub(sub1); err != nil {
+		t.Fatalf("Error creating sub: %v", err)
+	}
+	ss.(*FileSubStore).RLock()
+	fname := ss.(*FileSubStore).file.name
+	ss.(*FileSubStore).RUnlock()
+
+	s.Close()
+
+	f, err := openFileWithFlags(fname, os.O_CREATE|os.O_RDWR|os.O_APPEND)
+	if err != nil {
+		t.Fatalf("Error opening file: %v", err)
+	}
+	defer f.Close()
+	b := make([]byte, recordHeaderSize)
+	if _, err := f.Write(b); err != nil {
+		t.Fatalf("Error adding zeros: %v", err)
+	}
+	f.Close()
+
+	// Reopen file store
+	s, rs := openDefaultFileStore(t)
+	defer s.Close()
+	c = getRecoveredChannel(t, rs, "foo")
+	ss = c.Subs
+	subs := getRecoveredSubs(t, rs, "foo", 1)
+	sub := subs[0]
+	if !reflect.DeepEqual(sub.Sub, sub1) {
+		t.Fatalf("Expected subscription %v, got %v", sub1, sub.Sub)
+	}
+	// Add one more sub
+	sub2 := &spb.SubState{
+		ClientID:      "me2",
+		Inbox:         "inbox2",
+		AckInbox:      "ackInbox2",
+		AckWaitInSecs: 12,
+	}
+	if err := ss.CreateSub(sub2); err != nil {
+		t.Fatalf("Error creating sub: %v", err)
+	}
+	s.Close()
+
+	// Reopen file store
+	s, rs = openDefaultFileStore(t)
+	defer s.Close()
+	subs = getRecoveredSubs(t, rs, "foo", 2)
+	for _, sub := range subs {
+		// subs is an array but created from a map, so order is not guaranteed.
+		var osub *spb.SubState
+		if sub.Sub.ID == sub1.ID {
+			osub = sub1
+		} else {
+			osub = sub2
+		}
+		if !reflect.DeepEqual(sub.Sub, osub) {
+			t.Fatalf("Expected subscription %v, got %v", osub, sub.Sub)
+		}
+	}
+}
+
+func TestFSSubscriptionsFileVersionError(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ss := c.Subs
+	sub1 := &spb.SubState{
+		ClientID:      "me",
+		Inbox:         "inbox",
+		AckInbox:      "ackInbox",
+		AckWaitInSecs: 10,
+	}
+	if err := ss.CreateSub(sub1); err != nil {
+		t.Fatalf("Error creating sub: %v", err)
+	}
+	ss.(*FileSubStore).RLock()
+	fname := ss.(*FileSubStore).file.name
+	ss.(*FileSubStore).RUnlock()
+
+	s.Close()
+
+	os.Remove(fname)
+	if err := ioutil.WriteFile(fname, []byte(""), 0666); err != nil {
+		t.Fatalf("Error writing file: %v", err)
+	}
+
+	s, err := NewFileStore(testLogger, testFSDefaultDatastore, nil)
+	if err != nil {
+		t.Fatalf("Error creating filestore: %v", err)
+	}
+	defer s.Close()
+	if _, err := s.Recover(); err == nil || !strings.Contains(err.Error(), "recover subscription store for [foo]") {
+		t.Fatalf("Unexpected error: %v", err)
 	}
 }

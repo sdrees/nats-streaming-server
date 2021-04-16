@@ -1,4 +1,15 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2017-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -10,19 +21,22 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
-	gnatsd "github.com/nats-io/gnatsd/server"
+	natsd "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/prometheus/procfs"
 )
 
 // Routes for the monitoring pages
 const (
-	RootPath     = "/streaming"
-	ServerPath   = RootPath + "/serverz"
-	StorePath    = RootPath + "/storez"
-	ClientsPath  = RootPath + "/clientsz"
-	ChannelsPath = RootPath + "/channelsz"
+	RootPath       = "/streaming"
+	ServerPath     = RootPath + "/serverz"
+	StorePath      = RootPath + "/storez"
+	ClientsPath    = RootPath + "/clientsz"
+	ChannelsPath   = RootPath + "/channelsz"
+	IsFTActivePath = RootPath + "/isFTActive"
 
 	defaultMonitorListLimit = 1024
 )
@@ -34,6 +48,8 @@ type Serverz struct {
 	Version       string    `json:"version"`
 	GoVersion     string    `json:"go"`
 	State         string    `json:"state"`
+	Role          string    `json:"role,omitempty"`
+	NodeID        string    `json:"node_id,omitempty"`
 	Now           time.Time `json:"now"`
 	Start         time.Time `json:"start_time"`
 	Uptime        string    `json:"uptime"`
@@ -42,6 +58,12 @@ type Serverz struct {
 	Channels      int       `json:"channels"`
 	TotalMsgs     int       `json:"total_msgs"`
 	TotalBytes    uint64    `json:"total_bytes"`
+	InMsgs        int64     `json:"in_msgs"`
+	InBytes       int64     `json:"in_bytes"`
+	OutMsgs       int64     `json:"out_msgs"`
+	OutBytes      int64     `json:"out_bytes"`
+	OpenFDs       int       `json:"open_fds,omitempty"`
+	MaxFDs        int       `json:"max_fds,omitempty"`
 }
 
 // Storez describes the NATS Streaming Store
@@ -71,6 +93,7 @@ type Clientsz struct {
 type Clientz struct {
 	ID            string                      `json:"id"`
 	HBInbox       string                      `json:"hb_inbox"`
+	SubsCount     int                         `json:"subs_count"`
 	Subscriptions map[string][]*Subscriptionz `json:"subscriptions,omitempty"`
 }
 
@@ -94,11 +117,13 @@ type Channelz struct {
 	Bytes         uint64           `json:"bytes"`
 	FirstSeq      uint64           `json:"first_seq"`
 	LastSeq       uint64           `json:"last_seq"`
+	SubsCount     int              `json:"subs_count"`
 	Subscriptions []*Subscriptionz `json:"subscriptions,omitempty"`
 }
 
 // Subscriptionz describes a NATS Streaming Subscription
 type Subscriptionz struct {
+	ClientID     string `json:"client_id"`
 	Inbox        string `json:"inbox"`
 	AckInbox     string `json:"ack_inbox"`
 	DurableName  string `json:"durable_name,omitempty"`
@@ -112,12 +137,16 @@ type Subscriptionz struct {
 	IsStalled    bool   `json:"is_stalled"`
 }
 
-func (s *StanServer) startMonitoring(nOpts *gnatsd.Options) error {
+func (s *StanServer) startMonitoring(nOpts *natsd.Options) error {
 	var hh http.Handler
 	// If we are connecting to remote NATS Server, we start our own
 	// HTTP(s) server.
 	if s.opts.NATSServerURL != "" {
-		s.natsServer = gnatsd.New(nOpts)
+		ns, err := natsd.NewServer(nOpts)
+		if err != nil {
+			return err
+		}
+		s.natsServer = ns
 		if err := s.natsServer.StartMonitoring(); err != nil {
 			return err
 		}
@@ -135,6 +164,7 @@ func (s *StanServer) startMonitoring(nOpts *gnatsd.Options) error {
 	mux.HandleFunc(StorePath, s.handleStorez)
 	mux.HandleFunc(ClientsPath, s.handleClientsz)
 	mux.HandleFunc(ChannelsPath, s.handleChannelsz)
+	mux.HandleFunc(IsFTActivePath, s.handleIsFTActivez)
 
 	return nil
 }
@@ -151,10 +181,10 @@ func (s *StanServer) handleRootz(w http.ResponseWriter, r *http.Request) {
   <body>
     <img src="http://nats.io/img/logo.png" alt="NATS Streaming">
     <br/>
-	<a href=%s>server</a><br/>
-	<a href=%s>store</a><br/>
-	<a href=%s>clients</a><br/>
-	<a href=%s>channels</a><br/>
+	<a href=.%s>server</a><br/>
+	<a href=.%s>store</a><br/>
+	<a href=.%s>clients</a><br/>
+	<a href=.%s>channels</a><br/>
     <br/>
     <a href=http://nats.io/documentation/server/gnatsd-monitoring/>help</a>
   </body>
@@ -168,19 +198,43 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Error getting information about channels state: %v", err), http.StatusInternalServerError)
 		return
 	}
+	var role string
+	var nodeID string
 	s.mu.RLock()
 	state := s.state
+	if s.raft != nil {
+		role = s.raft.State().String()
+		nodeID = s.info.NodeID
+	}
 	s.mu.RUnlock()
-	s.monMu.RLock()
-	numSubs := s.numSubs
-	s.monMu.RUnlock()
+
+	numSubs := s.numSubs()
 	now := time.Now()
+
+	fds := 0
+	maxFDs := 0
+	if p, err := procfs.Self(); err == nil {
+		fds, err = p.FileDescriptorsLen()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error getting file descriptors len: %v", err), http.StatusInternalServerError)
+			return
+		}
+		limits, err := p.Limits()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error getting process limits: %v", err), http.StatusInternalServerError)
+			return
+		}
+		maxFDs = int(limits.OpenFiles)
+	}
+
 	serverz := &Serverz{
 		ClusterID:     s.info.ClusterID,
 		ServerID:      s.serverID,
 		Version:       VERSION,
 		GoVersion:     runtime.Version(),
 		State:         state.String(),
+		Role:          role,
+		NodeID:        nodeID,
 		Now:           now,
 		Start:         s.startTime,
 		Uptime:        myUptime(now.Sub(s.startTime)),
@@ -189,8 +243,25 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		Subscriptions: numSubs,
 		TotalMsgs:     count,
 		TotalBytes:    bytes,
+		InMsgs:        atomic.LoadInt64(&s.stats.inMsgs),
+		InBytes:       atomic.LoadInt64(&s.stats.inBytes),
+		OutMsgs:       atomic.LoadInt64(&s.stats.outMsgs),
+		OutBytes:      atomic.LoadInt64(&s.stats.outBytes),
+		OpenFDs:       fds,
+		MaxFDs:        maxFDs,
 	}
 	s.sendResponse(w, r, serverz)
+}
+
+func (s *StanServer) handleIsFTActivez(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+	if state == FTActive {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func myUptime(d time.Duration) string {
@@ -266,13 +337,14 @@ func (s *StanServer) handleClientsz(w http.ResponseWriter, r *http.Request) {
 
 		// Since clients may be unregistered between the time we get the client IDs
 		// and the time we build carr array, lets count the number of elements
-		// actually intserted.
+		// actually inserted.
 		carrSize := 0
 		for _, c := range carr {
 			client := s.clients.lookup(c.ID)
 			if client != nil {
 				client.RLock()
 				c.HBInbox = client.info.HbInbox
+				c.SubsCount = len(client.subs)
 				if subsOption == 1 {
 					c.Subscriptions = getMonitorClientSubs(client)
 				}
@@ -303,8 +375,9 @@ func getMonitorClient(s *StanServer, clientID string, subsOption int) *Clientz {
 	cli.RLock()
 	defer cli.RUnlock()
 	cz := &Clientz{
-		HBInbox: cli.info.HbInbox,
-		ID:      cli.info.ID,
+		HBInbox:   cli.info.HbInbox,
+		ID:        cli.info.ID,
+		SubsCount: len(cli.subs),
 	}
 	if subsOption == 1 {
 		cz.Subscriptions = getMonitorClientSubs(cli)
@@ -356,9 +429,33 @@ func getMonitorChannelSubs(ss *subStore) []*Subscriptionz {
 	return subsz
 }
 
+func getMonitorChannelSubsCount(ss *subStore) int {
+	ss.RLock()
+	defer ss.RUnlock()
+	count := len(ss.psubs)
+	// Get only offline durables (the online also appear in ss.psubs)
+	for _, sub := range ss.durables {
+		if sub.ClientID == "" {
+			count++
+		}
+	}
+	for _, qsub := range ss.qsubs {
+		qsub.RLock()
+		count += len(qsub.subs)
+		// If this is a durable queue subscription and all members
+		// are offline, qsub.shadow will be not nil. Report this one.
+		if qsub.shadow != nil {
+			count++
+		}
+		qsub.RUnlock()
+	}
+	return count
+}
+
 func createSubscriptionz(sub *subState) *Subscriptionz {
 	sub.RLock()
 	subz := &Subscriptionz{
+		ClientID:     sub.ClientID,
 		Inbox:        sub.Inbox,
 		AckInbox:     sub.AckInbox,
 		DurableName:  sub.DurableName,
@@ -370,6 +467,10 @@ func createSubscriptionz(sub *subState) *Subscriptionz {
 		LastSent:     sub.LastSent,
 		PendingCount: len(sub.acksPending),
 		IsStalled:    sub.stalled,
+	}
+	// Case of offline durable (queue) subscriptions
+	if sub.ClientID == "" {
+		subz.ClientID = sub.savedClientID
 	}
 	sub.RUnlock()
 	return subz
@@ -416,7 +517,7 @@ func (s *StanServer) handleChannelsz(w http.ResponseWriter, r *http.Request) {
 			carr = carr[minoff:maxoff]
 			for _, cz := range carr {
 				cs := channels[cz.Name]
-				if err := updateChannelz(cz, cs, subsOption); err != nil {
+				if err := s.updateChannelz(cz, cs, subsOption); err != nil {
 					http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", channelName, err), http.StatusInternalServerError)
 					return
 				}
@@ -444,19 +545,19 @@ func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	channelz := &Channelz{Name: name}
-	if err := updateChannelz(channelz, cs, subsOption); err != nil {
+	if err := s.updateChannelz(channelz, cs, subsOption); err != nil {
 		http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", name, err), http.StatusInternalServerError)
 		return
 	}
 	s.sendResponse(w, r, channelz)
 }
 
-func updateChannelz(cz *Channelz, c *channel, subsOption int) error {
+func (s *StanServer) updateChannelz(cz *Channelz, c *channel, subsOption int) error {
 	msgs, bytes, err := c.store.Msgs.State()
 	if err != nil {
 		return fmt.Errorf("unable to get message state: %v", err)
 	}
-	fseq, lseq, err := c.store.Msgs.FirstAndLastSequence()
+	fseq, lseq, err := s.getChannelFirstAndlLastSeq(c)
 	if err != nil {
 		return fmt.Errorf("unable to get first and last sequence: %v", err)
 	}
@@ -464,9 +565,14 @@ func updateChannelz(cz *Channelz, c *channel, subsOption int) error {
 	cz.Bytes = bytes
 	cz.FirstSeq = fseq
 	cz.LastSeq = lseq
+	var subsCount int
 	if subsOption == 1 {
 		cz.Subscriptions = getMonitorChannelSubs(c.ss)
+		subsCount = len(cz.Subscriptions)
+	} else {
+		subsCount = getMonitorChannelSubsCount(c.ss)
 	}
+	cz.SubsCount = subsCount
 	return nil
 }
 
@@ -475,7 +581,7 @@ func (s *StanServer) sendResponse(w http.ResponseWriter, r *http.Request, conten
 	if err != nil {
 		s.log.Errorf("Error marshaling response to %q request: %v", r.URL, err)
 	}
-	gnatsd.ResponseHandler(w, r, b)
+	natsd.ResponseHandler(w, r, b)
 }
 
 func getOffsetAndLimit(r *http.Request) (int, int) {

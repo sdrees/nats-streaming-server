@@ -1,4 +1,15 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2017-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -12,14 +23,18 @@ import (
 	"net/http"
 	"reflect"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
+	"github.com/hashicorp/raft"
+	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 const (
@@ -31,12 +46,12 @@ const (
 )
 
 var defaultMonitorOptions = natsd.Options{
-	Host:     "localhost",
+	Host:     "127.0.0.1",
 	Port:     4222,
 	HTTPHost: monitorHost,
 	HTTPPort: monitorPort,
 	Cluster: natsd.ClusterOpts{
-		Host: "localhost",
+		Host: "127.0.0.1",
 		Port: 6222,
 	},
 	NoLog:  true,
@@ -111,7 +126,7 @@ func TestMonitorStartOwnHTTPServer(t *testing.T) {
 	nOpts.HTTPHost = monitorHost
 	nOpts.HTTPPort = monitorPort
 	sOpts := GetDefaultOptions()
-	sOpts.NATSServerURL = "nats://localhost:4222"
+	sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
 
@@ -127,14 +142,14 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	nOpts := natsdTest.DefaultTestOptions
 	nOpts.HTTPHost = monitorHost
 	nOpts.HTTPSPort = monitorPort
-	nOpts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	nOpts.TLSConfig = &tls.Config{ServerName: "localhost"}
 	cert, err := tls.LoadX509KeyPair("../test/certs/server-cert.pem", "../test/certs/server-key.pem")
 	if err != nil {
 		t.Fatalf("Got error reading certificates: %s", err)
 	}
 	nOpts.TLSConfig.Certificates = []tls.Certificate{cert}
 	sOpts := GetDefaultOptions()
-	sOpts.NATSServerURL = "nats://localhost:4222"
+	sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
 
@@ -221,9 +236,31 @@ func TestMonitorServerz(t *testing.T) {
 	if sz.TotalBytes != totalBytes {
 		t.Fatalf("Expected %v bytes, got %v", totalBytes, sz.TotalBytes)
 	}
+	if runtime.GOOS == "linux" {
+		if sz.OpenFDs == 0 {
+			t.Fatalf("Expected more than 0 open files, got %v", sz.OpenFDs)
+		}
+		if sz.MaxFDs == 0 {
+			t.Fatalf("Expected open files limit to be bigger than 0, got %v", sz.MaxFDs)
+		}
+	} else {
+		if sz.OpenFDs != 0 {
+			t.Fatalf("Expected 0 open files, got %v", sz.OpenFDs)
+		}
+		if sz.MaxFDs != 0 {
+			t.Fatalf("Expected open files limit to 0, got %v", sz.MaxFDs)
+		}
+		// Not only check that values are expected to be 0, but that we don't even
+		// find them in the json content (omitempty)
+		if strings.Contains(string(body), "max_fds") || strings.Contains(string(body), "open_fds") {
+			t.Fatal("open_fds and max_fds should be omitempty")
+		}
+	}
 	resp.Body.Close()
 
-	sub.Unsubscribe()
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 	waitForNumSubs(t, s, clientName, 0)
 
 	resp, body = getBody(t, ServerPath, expectedJSON)
@@ -338,6 +375,48 @@ func TestMonitorServerz(t *testing.T) {
 	c := channelsLookupOrCreate(t, s, "foo")
 	c.store.Msgs = &msgStoreFailMsgState{MsgStore: c.store.Msgs}
 	monitorExpectStatus(t, ServerPath, http.StatusInternalServerError)
+}
+
+func TestMonitorIsFTActiveFTServer(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		checkActive    bool
+		expectedStatus int
+	}{
+		{"active", true, http.StatusOK},
+		{"standby", false, http.StatusNoContent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetPreviousHTTPConnections()
+
+			cleanupFTDatastore(t)
+			defer cleanupFTDatastore(t)
+
+			nopts := defaultMonitorOptions
+			var aNOpts *natsd.Options
+			var sNOpts *natsd.Options
+
+			if test.checkActive {
+				aNOpts = &nopts
+			} else {
+				sNOpts = &nopts
+			}
+
+			opts := getTestFTDefaultOptions()
+			active := runServerWithOpts(t, opts, aNOpts)
+			defer active.Shutdown()
+
+			getFTActiveServer(t, active)
+
+			opts = getTestFTDefaultOptions()
+			opts.NATSServerURL = "nats://127.0.0.1:4222"
+			standby := runServerWithOpts(t, opts, sNOpts)
+			defer standby.Shutdown()
+
+			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, test.expectedStatus, "")
+			defer resp.Body.Close()
+		})
+	}
 }
 
 func TestMonitorUptime(t *testing.T) {
@@ -518,7 +597,7 @@ func TestMonitorStorez(t *testing.T) {
 	defer cleanupDatastore(t)
 	opts := getTestDefaultOptsForPersistentStore()
 	s = runMonitorServer(t, opts)
-	testStore(s, stores.TypeFile)
+	testStore(s, persistentStoreType)
 }
 
 func TestMonitorClientsz(t *testing.T) {
@@ -555,8 +634,9 @@ func TestMonitorClientsz(t *testing.T) {
 			cli := s.clients.lookup(cid)
 			cli.RLock()
 			cz := &Clientz{
-				ID:      cid,
-				HBInbox: cli.info.HbInbox,
+				ID:        cid,
+				HBInbox:   cli.info.HbInbox,
+				SubsCount: len(cli.subs),
 			}
 			if expectSubs {
 				cz.Subscriptions = getCliSubs(cli.subs)
@@ -636,6 +716,7 @@ func getChannelSubs(subs []*subState) []*Subscriptionz {
 func createSubz(sub *subState) *Subscriptionz {
 	sub.RLock()
 	subz := &Subscriptionz{
+		ClientID:     sub.ClientID,
 		Inbox:        sub.Inbox,
 		AckInbox:     sub.AckInbox,
 		DurableName:  sub.DurableName,
@@ -681,8 +762,9 @@ func TestMonitorClientz(t *testing.T) {
 		}
 		cli.RLock()
 		cz := &Clientz{
-			ID:      cid,
-			HBInbox: cli.info.HbInbox,
+			ID:        cid,
+			HBInbox:   cli.info.HbInbox,
+			SubsCount: len(cli.subs),
 		}
 		if expectSubs {
 			cz.Subscriptions = getCliSubs(cli.subs)
@@ -845,7 +927,7 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 	for _, c := range channels {
 		cs := channelsLookupOrCreate(t, s, c)
 		for i := 0; i < rand.Intn(10)+1; i++ {
-			cs.store.Msgs.Store([]byte("hello"))
+			cs.store.Msgs.Store(&pb.MsgProto{Data: []byte("hello")})
 		}
 		numSubs := rand.Intn(4) + 1
 		totalSubs += numSubs
@@ -905,6 +987,7 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 					qsub.RUnlock()
 				}
 				ss.RUnlock()
+				channelz.SubsCount = len(subscriptions)
 				channelz.Subscriptions = subscriptions
 				channelsz.Channels = append(channelsz.Channels, channelz)
 			}
@@ -981,7 +1064,7 @@ func TestMonitorChannelz(t *testing.T) {
 	for _, c := range channels {
 		cs := channelsLookupOrCreate(t, s, c)
 		for i := 0; i < rand.Intn(10)+1; i++ {
-			cs.store.Msgs.Store([]byte("hello"))
+			cs.store.Msgs.Store(&pb.MsgProto{Data: []byte("hello")})
 		}
 		if _, err := sc.Subscribe(c, func(_ *stan.Msg) {}); err != nil {
 			t.Fatalf("Error on subscribe: %v", err)
@@ -995,16 +1078,18 @@ func TestMonitorChannelz(t *testing.T) {
 		}
 		msgs, bytes := msgStoreState(t, cs.store.Msgs)
 		firstSeq, lastSeq := msgStoreFirstAndLastSequence(t, cs.store.Msgs)
+		ss := cs.ss
+		subs := getChannelSubs(ss.psubs)
 		channelz := &Channelz{
-			Name:     name,
-			FirstSeq: firstSeq,
-			LastSeq:  lastSeq,
-			Msgs:     msgs,
-			Bytes:    bytes,
+			Name:      name,
+			FirstSeq:  firstSeq,
+			LastSeq:   lastSeq,
+			Msgs:      msgs,
+			Bytes:     bytes,
+			SubsCount: len(subs),
 		}
 		if expectedSubs {
-			ss := cs.ss
-			channelz.Subscriptions = getChannelSubs(ss.psubs)
+			channelz.Subscriptions = subs
 		}
 		return channelz
 	}
@@ -1097,6 +1182,10 @@ func TestMonitorDurableSubs(t *testing.T) {
 					if sub.IsOffline != expectedOffline {
 						stackFatalf(t, "Unexpected IsOffline, wants %v, got %v", expectedOffline, sub.IsOffline)
 					}
+					// ClientID are now always reported, even when the durables are offline
+					if sub.ClientID == "" {
+						stackFatalf(t, "ClientID should always have a value")
+					}
 				}
 			}
 			// There should be 1 sub
@@ -1117,5 +1206,245 @@ func TestMonitorDurableSubs(t *testing.T) {
 			// There shouldn't be any sub now
 			getAndCheck(false, 0)
 		}
+	}
+}
+
+func TestMonitorClusterRole(t *testing.T) {
+	nOpts := defaultMonitorOptions
+	for _, test := range []struct {
+		name         string
+		expectedRole string
+		n1Opts       *natsd.Options
+		n2Opts       *natsd.Options
+	}{
+		{
+			"leader",
+			raft.Leader.String(),
+			&nOpts,
+			nil,
+		},
+		{
+			"follower",
+			raft.Follower.String(),
+			nil,
+			&nOpts,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetPreviousHTTPConnections()
+
+			cleanupDatastore(t)
+			defer cleanupDatastore(t)
+			cleanupRaftLog(t)
+			defer cleanupRaftLog(t)
+
+			// For this test, use a central NATS server.
+			ns := natsdTest.RunDefaultServer()
+			defer ns.Shutdown()
+
+			s1sOpts := getTestDefaultOptsForClustering("a", true)
+			s1 := runServerWithOpts(t, s1sOpts, test.n1Opts)
+			defer s1.Shutdown()
+
+			s2sOpts := getTestDefaultOptsForClustering("b", false)
+			s2 := runServerWithOpts(t, s2sOpts, test.n2Opts)
+			defer s2.Shutdown()
+
+			l := getLeader(t, 10*time.Second, s1, s2)
+
+			resp, body := getBody(t, ServerPath, expectedJSON)
+			resp.Body.Close()
+			sz := Serverz{}
+			if err := json.Unmarshal(body, &sz); err != nil {
+				t.Fatalf("Got an error unmarshalling the body: %v", err)
+			}
+			if sz.Role != test.expectedRole {
+				t.Fatalf("Expected role to be %v, got %v", test.expectedRole, sz.Role)
+			}
+			var nodeID string
+			if test.name == "leader" {
+				nodeID = l.info.NodeID
+			} else if l == s1 {
+				nodeID = s2.info.NodeID
+			} else {
+				nodeID = s1.info.NodeID
+			}
+			if sz.NodeID != nodeID {
+				t.Fatalf("Expected nodeID to be %q, got %q", nodeID, sz.NodeID)
+			}
+		})
+	}
+}
+
+func TestMonitorNumSubs(t *testing.T) {
+	resetPreviousHTTPConnections()
+	s := runMonitorServer(t, GetDefaultOptions())
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	checkNumSubs := func(t *testing.T, expected int) {
+		waitFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			resp, body := getBody(t, ServerPath, expectedJSON)
+			resp.Body.Close()
+			sz := Serverz{}
+			if err := json.Unmarshal(body, &sz); err != nil {
+				t.Fatalf("Got an error unmarshalling the body: %v", err)
+			}
+			if sz.Subscriptions != expected {
+				return fmt.Errorf("Expected %v subscriptions, got %v", expected, sz.Subscriptions)
+			}
+			return nil
+		})
+	}
+
+	cb := func(_ *stan.Msg) {}
+
+	dur, err := sc.Subscribe("foo", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 1)
+
+	qsub1, err := sc.QueueSubscribe("foo", "queue", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 2)
+
+	qsub2, err := sc.QueueSubscribe("foo", "queue", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 3)
+
+	// Closing one of the durable queue member will get the count down.
+	qsub1.Close()
+	checkNumSubs(t, 2)
+
+	// But the last one should keep the count since the durable interest stays.
+	qsub2.Close()
+	checkNumSubs(t, 2)
+
+	// Same for closing the durable
+	dur.Close()
+	checkNumSubs(t, 2)
+
+	// Create a non-durable, count should increase, then close, count should go down.
+	sub, err := sc.Subscribe("foo", cb)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 3)
+	sub.Close()
+	checkNumSubs(t, 2)
+
+	// Try with non durable queue group
+	qs1, err := sc.QueueSubscribe("foo", "ndqueue", cb)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 3)
+
+	qs2, err := sc.QueueSubscribe("foo", "ndqueue", cb)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 4)
+
+	qs1.Close()
+	checkNumSubs(t, 3)
+	qs2.Close()
+	checkNumSubs(t, 2)
+
+	// Now resume the durable, count should remain same.
+	dur, err = sc.Subscribe("foo", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 2)
+
+	// Restart a queue member, same story
+	qsub1, err = sc.QueueSubscribe("foo", "queue", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 2)
+
+	// Now a second and then count should go up.
+	qsub2, err = sc.QueueSubscribe("foo", "queue", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, 3)
+
+	// Unsubscribe them all and count should go to 0.
+	qsub2.Unsubscribe()
+	qsub1.Unsubscribe()
+	dur.Unsubscribe()
+	checkNumSubs(t, 0)
+}
+
+func TestMonitorInOutMsgs(t *testing.T) {
+	resetPreviousHTTPConnections()
+	s := runMonitorServer(t, GetDefaultOptions())
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	mch := make(chan *stan.Msg, 5)
+	count := int32(0)
+	if _, err := sc.Subscribe("foo", func(m *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+		if !m.Redelivered {
+			select {
+			case mch <- m:
+			default:
+			}
+		}
+	},
+		stan.SetManualAckMode(),
+		stan.AckWait(ackWaitInMs(500))); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+	}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		sc.Publish("foo", []byte("msg"))
+	}
+
+	resp, body := getBody(t, ServerPath, expectedJSON)
+	resp.Body.Close()
+	sz := Serverz{}
+	if err := json.Unmarshal(body, &sz); err != nil {
+		t.Fatalf("Got an error unmarshalling the body: %v", err)
+	}
+	if sz.InMsgs != 5 || sz.InBytes == 0 {
+		t.Fatalf("Expected 5 inbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+	if sz.OutMsgs != 10 || sz.OutBytes == 0 {
+		t.Fatalf("Expected 10 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+
+	time.Sleep(700 * time.Millisecond)
+
+	resp, body = getBody(t, ServerPath, expectedJSON)
+	resp.Body.Close()
+	sz = Serverz{}
+	if err := json.Unmarshal(body, &sz); err != nil {
+		t.Fatalf("Got an error unmarshalling the body: %v", err)
+	}
+	if sz.InMsgs != 5 || sz.InBytes == 0 {
+		t.Fatalf("Expected 5 inbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+	if sz.OutMsgs != 15 || sz.OutBytes == 0 {
+		t.Fatalf("Expected 15 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
 	}
 }

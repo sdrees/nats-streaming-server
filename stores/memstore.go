@@ -1,4 +1,15 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
@@ -7,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/util"
+	"github.com/nats-io/stan.go/pb"
 )
 
 // MemoryStore is a factory for message and subscription stores.
@@ -77,22 +88,26 @@ func (ms *MemoryStore) CreateChannel(channel string) (*Channel, error) {
 ////////////////////////////////////////////////////////////////////////////
 
 // Store a given message.
-func (ms *MemoryMsgStore) Store(data []byte) (uint64, error) {
+func (ms *MemoryMsgStore) Store(m *pb.MsgProto) (uint64, error) {
 	ms.Lock()
 	defer ms.Unlock()
 
-	if ms.first == 0 {
-		ms.first = 1
+	if m.Sequence <= ms.last {
+		// We've already seen this message.
+		return m.Sequence, nil
 	}
-	ms.last++
-	m := ms.genericMsgStore.createMsg(ms.last, data)
+
+	if ms.first == 0 {
+		ms.first = m.Sequence
+	}
+	ms.last = m.Sequence
 	ms.msgs[ms.last] = m
 	ms.totalCount++
 	ms.totalBytes += uint64(m.Size())
 	// If there is an age limit and no timer yet created, do so now
 	if ms.limits.MaxAge > time.Duration(0) && ms.ageTimer == nil {
 		ms.wg.Add(1)
-		ms.ageTimer = time.AfterFunc(ms.limits.MaxAge, ms.expireMsgs)
+		ms.ageTimer = time.AfterFunc(ms.msgExpireIn(m.Timestamp), ms.expireMsgs)
 	}
 
 	// Check if we need to remove any (but leave at least the last added)
@@ -105,7 +120,7 @@ func (ms *MemoryMsgStore) Store(data []byte) (uint64, error) {
 			ms.removeFirstMsg()
 			if !ms.hitLimit {
 				ms.hitLimit = true
-				ms.log.Noticef(droppingMsgsFmt, ms.subject, ms.totalCount, ms.limits.MaxMsgs,
+				ms.log.Warnf(droppingMsgsFmt, ms.subject, ms.totalCount, ms.limits.MaxMsgs,
 					util.FriendlyBytes(int64(ms.totalBytes)), util.FriendlyBytes(ms.limits.MaxBytes))
 			}
 		}
@@ -152,10 +167,13 @@ func (ms *MemoryMsgStore) GetSequenceFromTimestamp(timestamp int64) (uint64, err
 	if ms.first > ms.last {
 		return ms.last + 1, nil
 	}
-	if ms.msgs[ms.first].Timestamp >= timestamp {
+	if timestamp <= ms.msgs[ms.first].Timestamp {
 		return ms.first, nil
 	}
-	if timestamp >= ms.msgs[ms.last].Timestamp {
+	if timestamp == ms.msgs[ms.last].Timestamp {
+		return ms.last, nil
+	}
+	if timestamp > ms.msgs[ms.last].Timestamp {
 		return ms.last + 1, nil
 	}
 
@@ -170,18 +188,21 @@ func (ms *MemoryMsgStore) GetSequenceFromTimestamp(timestamp int64) (uint64, err
 // limit's MaxAge.
 func (ms *MemoryMsgStore) expireMsgs() {
 	ms.Lock()
+	defer ms.Unlock()
 	if ms.closed {
-		ms.Unlock()
 		ms.wg.Done()
 		return
 	}
-	defer ms.Unlock()
 
 	now := time.Now().UnixNano()
 	maxAge := int64(ms.limits.MaxAge)
 	for {
 		m, ok := ms.msgs[ms.first]
 		if !ok {
+			if ms.first < ms.last {
+				ms.first++
+				continue
+			}
 			ms.ageTimer = nil
 			ms.wg.Done()
 			return
@@ -207,6 +228,21 @@ func (ms *MemoryMsgStore) removeFirstMsg() {
 	ms.totalCount--
 	delete(ms.msgs, ms.first)
 	ms.first++
+}
+
+// Empty implements the MsgStore interface
+func (ms *MemoryMsgStore) Empty() error {
+	ms.Lock()
+	if ms.ageTimer != nil {
+		if ms.ageTimer.Stop() {
+			ms.wg.Done()
+		}
+		ms.ageTimer = nil
+	}
+	ms.empty()
+	ms.msgs = make(map[uint64]*pb.MsgProto)
+	ms.Unlock()
+	return nil
 }
 
 // Close implements the MsgStore interface

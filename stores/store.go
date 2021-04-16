@@ -1,4 +1,15 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
@@ -6,8 +17,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/spb"
+	"github.com/nats-io/stan.go/pb"
 )
 
 const (
@@ -15,6 +26,10 @@ const (
 	TypeMemory = "MEMORY"
 	// TypeFile is the store type name for file based stores
 	TypeFile = "FILE"
+	// TypeSQL is the store type name for sql based stores
+	TypeSQL = "SQL"
+	// TypeRaft is the store type name for the raft stores
+	TypeRaft = "RAFT"
 )
 
 // Errors.
@@ -23,6 +38,7 @@ var (
 	ErrTooManySubs     = errors.New("too many subscriptions per channel")
 	ErrNotSupported    = errors.New("not supported")
 	ErrAlreadyExists   = errors.New("already exists")
+	ErrNotFound        = errors.New("not found")
 )
 
 // StoreLimits define limits for a store.
@@ -43,6 +59,9 @@ type ChannelLimits struct {
 	MsgStoreLimits
 	// Limits for subscriptions stores
 	SubStoreLimits
+	// How long without any active subscription and no new message
+	// before this channel can be deleted.
+	MaxInactivity time.Duration `json:"max_inactivity"`
 }
 
 // MsgStoreLimits defines limits for a MsgStore.
@@ -77,6 +96,7 @@ var DefaultStoreLimits = StoreLimits{
 		SubStoreLimits{
 			MaxSubscriptions: 1000,
 		},
+		0,
 	},
 	nil,
 }
@@ -175,6 +195,10 @@ type Store interface {
 	// This call may return an error due to limits validation errors.
 	SetLimits(limits *StoreLimits) error
 
+	// GetChannelLimits returns the limit for this channel. If the channel
+	// does not exist, returns nil.
+	GetChannelLimits(name string) *ChannelLimits
+
 	// CreateChannel creates a Channel.
 	// Implementations should return ErrAlreadyExists if the channel was
 	// already created.
@@ -182,8 +206,19 @@ type Store interface {
 	// will apply. Otherwise, the global limits in StoreLimits will apply.
 	CreateChannel(channel string) (*Channel, error)
 
+	// DeleteChannel deletes a Channel.
+	// Implementations should make sure that if no error is returned, the
+	// channel would not be recovered after a restart, unless CreateChannel()
+	// with the same channel is invoked.
+	// If processing is expecting to be time consuming, work should be done
+	// in the background as long as the above condition is guaranteed.
+	// It is also acceptable for an implementation to have CreateChannel()
+	// return an error if background deletion is still happening for a
+	// channel of the same name.
+	DeleteChannel(channel string) error
+
 	// AddClient stores information about the client identified by `clientID`.
-	AddClient(clientID, hbInbox string) (*Client, error)
+	AddClient(info *spb.ClientInfo) (*Client, error)
 
 	// DeleteClient removes the client identified by `clientID` from the store.
 	DeleteClient(clientID string) error
@@ -230,7 +265,7 @@ type MsgStore interface {
 	State() (numMessages int, byteSize uint64, err error)
 
 	// Store stores a message and returns the message sequence.
-	Store(data []byte) (uint64, error)
+	Store(msg *pb.MsgProto) (uint64, error)
 
 	// Lookup returns the stored message with given sequence number.
 	Lookup(seq uint64) (*pb.MsgProto, error)
@@ -259,6 +294,9 @@ type MsgStore interface {
 
 	// Flush is for stores that may buffer operations and need them to be persisted.
 	Flush() error
+
+	// Empty removes all messages from the store
+	Empty() error
 
 	// Close closes the store.
 	Close() error

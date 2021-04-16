@@ -1,4 +1,17 @@
-// Copyright 2016 Apcera Inc. All rights reserved.
+// Copyright 2017-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:generate protoc -I=. -I=$GOPATH/src  --gofast_out=. ./spb/protocol.proto
 
 package main
 
@@ -8,29 +21,51 @@ import (
 	"os"
 	"runtime"
 
-	natsd "github.com/nats-io/gnatsd/server"
+	natsd "github.com/nats-io/nats-server/v2/server"
 	stand "github.com/nats-io/nats-streaming-server/server"
+
+	_ "github.com/go-sql-driver/mysql"                              // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
+	_ "github.com/nats-io/nats-streaming-server/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
 )
 
 var usageStr = `
 Usage: nats-streaming-server [options]
 
 Streaming Server Options:
-    -cid, --cluster_id  <string>     Cluster ID (default: test-cluster)
-    -st,  --store <string>           Store type: MEMORY|FILE (default: MEMORY)
-          --dir <string>             For FILE store type, this is the root directory
-    -mc,  --max_channels <int>       Max number of channels (0 for unlimited)
-    -msu, --max_subs <int>           Max number of subscriptions per channel (0 for unlimited)
-    -mm,  --max_msgs <int>           Max number of messages per channel (0 for unlimited)
-    -mb,  --max_bytes <size>         Max messages total size per channel (0 for unlimited)
-    -ma,  --max_age <duration>       Max duration a message can be stored ("0s" for unlimited)
-    -ns,  --nats_server <string>     Connect to this external NATS Server URL (embedded otherwise)
-    -sc,  --stan_config <string>     Streaming server configuration file
-    -hbi, --hb_interval <duration>   Interval at which server sends heartbeat to a client
-    -hbt, --hb_timeout <duration>    How long server waits for a heartbeat response
-    -hbf, --hb_fail_count <int>      Number of failed heartbeats before server closes the client connection
-          --ack_subs <int>           Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
-          --ft_group <string>        Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
+    -cid, --cluster_id  <string>         Cluster ID (default: test-cluster)
+    -st,  --store <string>               Store type: MEMORY|FILE|SQL (default: MEMORY)
+          --dir <string>                 For FILE store type, this is the root directory
+    -mc,  --max_channels <int>           Max number of channels (0 for unlimited)
+    -msu, --max_subs <int>               Max number of subscriptions per channel (0 for unlimited)
+    -mm,  --max_msgs <int>               Max number of messages per channel (0 for unlimited)
+    -mb,  --max_bytes <size>             Max messages total size per channel (0 for unlimited)
+    -ma,  --max_age <duration>           Max duration a message can be stored ("0s" for unlimited)
+    -mi,  --max_inactivity <duration>    Max inactivity (no new message, no subscription) after which a channel can be garbage collected (0 for unlimited)
+    -ns,  --nats_server <string>         Connect to this external NATS Server URL (embedded otherwise)
+    -sc,  --stan_config <string>         Streaming server configuration file
+    -hbi, --hb_interval <duration>       Interval at which server sends heartbeat to a client
+    -hbt, --hb_timeout <duration>        How long server waits for a heartbeat response
+    -hbf, --hb_fail_count <int>          Number of failed heartbeats before server closes the client connection
+          --ft_group <string>            Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore
+    -sl,  --signal <signal>[=<pid>]      Send signal to nats-streaming-server process (stop, quit, reopen, reload - only for embedded NATS Server)
+          --encrypt <bool>               Specify if server should use encryption at rest
+          --encryption_cipher <string>   Cipher to use for encryption. Currently support AES and CHAHA (ChaChaPoly). Defaults to AES
+          --encryption_key <string>      Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
+          --replace_durable <bool>       Replace the existing durable subscription instead of reporting a duplicate durable error
+
+Streaming Server Clustering Options:
+    --clustered <bool>                     Run the server in a clustered configuration (default: false)
+    --cluster_node_id <string>             ID of the node within the cluster if there is no stored ID (default: random UUID)
+    --cluster_bootstrap <bool>             Bootstrap the cluster if there is no existing state by electing self as leader (default: false)
+    --cluster_peers <string, ...>          Comma separated list of cluster peer node IDs to bootstrap cluster state
+    --cluster_log_path <string>            Directory to store log replication data
+    --cluster_log_cache_size <int>         Number of log entries to cache in memory to reduce disk IO (default: 512)
+    --cluster_log_snapshots <int>          Number of log snapshots to retain (default: 2)
+    --cluster_trailing_logs <int>          Number of log entries to leave after a snapshot and compaction
+    --cluster_sync <bool>                  Do a file sync after every write to the replication log and message store
+    --cluster_raft_logging <bool>          Enable logging from the Raft library (disabled by default)
+    --cluster_allow_add_remove_node <bool> Enable the ability to send NATS requests to the leader to add/remove cluster nodes
 
 Streaming Server File Store Options:
     --file_compact_enabled <bool>        Enable file compaction
@@ -47,6 +82,16 @@ Streaming Server File Store Options:
     --file_slice_archive_script <string> Path to script to use if you want to archive a file slice being removed
     --file_fds_limit <int>               Store will try to use no more file descriptors than this given limit
     --file_parallel_recovery <int>       On startup, number of channels that can be recovered in parallel
+    --file_truncate_bad_eof <bool>       Truncate files for which there is an unexpected EOF on recovery, dataloss may occur
+    --file_read_buffer_size <size>       Size of messages read ahead buffer (0 to disable)
+    --file_auto_sync <duration>          Interval at which the store should be automatically flushed and sync'ed on disk (<= 0 to disable)
+
+Streaming Server SQL Store Options:
+    --sql_driver <string>            Name of the SQL Driver ("mysql" or "postgres")
+    --sql_source <string>            Datasource used when opening an SQL connection to the database
+    --sql_no_caching <bool>          Enable/Disable caching for improved performance
+    --sql_max_open_conns <int>       Maximum number of opened connections to the database
+    --sql_bulk_insert_limit <int>    Maximum number of messages stored with a single SQL "INSERT" statement
 
 Streaming Server TLS Options:
     -secure <bool>                   Use a TLS connection to the NATS server without
@@ -59,6 +104,7 @@ Streaming Server Logging Options:
     -SD, --stan_debug=<bool>         Enable STAN debugging output
     -SV, --stan_trace=<bool>         Trace the raw STAN protocol
     -SDV                             Debug and trace STAN
+         --syslog_name               On Windows, when running several servers as a service, use this name for the event source
     (See additional NATS logging options below)
 
 Embedded NATS Server Options:
@@ -72,7 +118,7 @@ Embedded NATS Server Options:
 Logging Options:
     -l, --log <string>               File to redirect log output
     -T, --logtime=<bool>             Timestamp log entries (default: true)
-    -s, --syslog <string>            Enable syslog as log method
+    -s, --syslog <bool>              Enable syslog as log method
     -r, --remote_syslog <string>     Syslog server addr (udp://localhost:514)
     -D, --debug=<bool>               Enable debugging output
     -V, --trace=<bool>               Trace the raw protocol
@@ -115,7 +161,8 @@ func main() {
 	nOpts.NoSigs = true
 	// Without this option set to true, the logger is not configured.
 	sOpts.EnableLogging = true
-	if _, err := stand.RunServerWithOpts(sOpts, nOpts); err != nil {
+	// This will invoke RunServerWithOpts but on Windows, may run it as a service.
+	if _, err := stand.Run(sOpts, nOpts); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
@@ -134,7 +181,7 @@ func parseFlags() (*stand.Options, *natsd.Options) {
 		fs.Usage,
 		natsd.PrintTLSHelpAndDie)
 	if err != nil {
-		natsd.PrintAndDie(err.Error() + "\n" + usageStr)
+		natsd.PrintAndDie(err.Error())
 	}
 	return stanOpts, natsOpts
 }

@@ -1,4 +1,16 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2020 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package server
 
 import (
@@ -8,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 type mockedStore struct {
@@ -27,7 +39,9 @@ type mockedMsgStore struct {
 type mockedSubStore struct {
 	stores.SubStore
 	sync.RWMutex
-	fail bool
+	fail          bool
+	failFlushOnce bool
+	ch            chan bool
 }
 
 func (ms *mockedStore) CreateChannel(name string) (*stores.Channel, error) {
@@ -201,9 +215,15 @@ func TestMsgLookupFailures(t *testing.T) {
 	sub.Unsubscribe()
 
 	// Create subscription, manual ack mode, don't ack, wait for redelivery
-	sub, err = sc.Subscribe("foo", func(_ *stan.Msg) {
-		rcvCh <- true
-	}, stan.DeliverAllAvailable(), stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(15)))
+	rdlvCh := make(chan bool)
+	sub, err = sc.Subscribe("foo", func(m *stan.Msg) {
+		if !m.Redelivered {
+			rcvCh <- true
+		} else if m.RedeliveryCount == 3 {
+			rdlvCh <- true
+			m.Ack()
+		}
+	}, stan.DeliverAllAvailable(), stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(50)))
 	if err != nil {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
@@ -234,56 +254,29 @@ func TestMsgLookupFailures(t *testing.T) {
 	mms.Lock()
 	mms.fail = false
 	mms.Unlock()
+
+	// Now make sure that we do get it redelivered when the error clears
+	select {
+	case <-rdlvCh:
+	case <-time.After(time.Second):
+		t.Fatal("Redelivery should have continued until error cleared")
+	}
 	sub.Unsubscribe()
+}
 
-	// Check that removal of qsub with pending message
-
-	// One queue member receives and acks
-	if _, err := sc.QueueSubscribe("bar", "queue", func(_ *stan.Msg) {}); err != nil {
-		t.Fatalf("Error on subscribe: %v", err)
+func (ss *mockedSubStore) CreateSub(sub *spb.SubState) error {
+	ss.RLock()
+	fail := ss.fail
+	ch := ss.ch
+	ss.RUnlock()
+	if ch != nil {
+		// Wait for notification that we can continue
+		<-ch
 	}
-	// Another member does not ack.
-	qsub2, err := sc.QueueSubscribe("bar", "queue", func(_ *stan.Msg) {
-		rcvCh <- true
-	}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(15)))
-	if err != nil {
-		t.Fatalf("Error on subscribe: %v", err)
+	if fail {
+		return fmt.Errorf("On purpose")
 	}
-
-	cs = channelsGet(t, s.channels, "bar")
-	mms = cs.store.Msgs.(*mockedMsgStore)
-
-	// Publish messages until qsub2 receives one
-forLoop:
-	for {
-		if err := sc.Publish("bar", []byte("hello")); err != nil {
-			t.Fatalf("Error on publish: %v", err)
-		}
-		select {
-		case <-rcvCh:
-			break forLoop
-		case <-time.After(500 * time.Millisecond):
-			// send a new message
-		}
-	}
-	// Activate store failures
-	mms.Lock()
-	mms.fail = true
-	logger.Lock()
-	logger.checkErrorStr = "Unable to update subscription"
-	logger.gotError = false
-	logger.Unlock()
-	mms.Unlock()
-	// Close qsub2, server should try to move unack'ed message to qsub1
-	if err := qsub2.Close(); err != nil {
-		t.Fatalf("Error closing qsub: %v", err)
-	}
-	logger.Lock()
-	gotErr = logger.gotError
-	logger.Unlock()
-	if !gotErr {
-		t.Fatalf("Did not capture error about updating subscription")
-	}
+	return ss.SubStore.CreateSub(sub)
 }
 
 func (ss *mockedSubStore) AddSeqPending(subid, seq uint64) error {
@@ -314,6 +307,16 @@ func (ss *mockedSubStore) DeleteSub(subid uint64) error {
 		return fmt.Errorf("On purpose")
 	}
 	return ss.SubStore.DeleteSub(subid)
+}
+
+func (ss *mockedSubStore) Flush() error {
+	ss.RLock()
+	fail := ss.failFlushOnce
+	ss.RUnlock()
+	if fail {
+		return fmt.Errorf("On purpose")
+	}
+	return ss.SubStore.Flush()
 }
 
 func TestDeleteSubFailures(t *testing.T) {
@@ -354,6 +357,9 @@ func TestDeleteSubFailures(t *testing.T) {
 	// Produce a message to this durable queue sub
 	if err := sc.Publish("foo", []byte("hello")); err != nil {
 		t.Fatalf("Error on publish: %v", err)
+	}
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our message")
 	}
 	// Create 2 more durable queue subs
 	dqsub2, err := sc.QueueSubscribe("foo", "dqueue", func(_ *stan.Msg) {},
@@ -465,6 +471,48 @@ func TestUpdateSubFailure(t *testing.T) {
 	}
 }
 
+func TestCloseClientWithDurableSubs(t *testing.T) {
+	logger := &checkErrorLogger{checkErrorStr: "flushing store"}
+	opts := GetDefaultOptions()
+	opts.CustomLogger = logger
+	s, err := RunServerWithOpts(opts, nil)
+	if err != nil {
+		t.Fatalf("Error running server: %v", err)
+	}
+	defer s.Shutdown()
+
+	s.channels.Lock()
+	s.channels.store = &mockedStore{Store: s.channels.store}
+	s.channels.Unlock()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	if _, err := sc.QueueSubscribe("foo", "bar",
+		func(_ *stan.Msg) {},
+		stan.DurableName("dur")); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	waitForNumSubs(t, s, clientName, 1)
+
+	cs := channelsGet(t, s.channels, "foo")
+	mss := cs.store.Subs.(*mockedSubStore)
+	mss.Lock()
+	mss.failFlushOnce = true
+	mss.Unlock()
+
+	// Close client, we should get failure trying to update the queue sub record
+	sc.Close()
+	waitForNumClients(t, s, 0)
+
+	logger.Lock()
+	gotIt := logger.gotError
+	logger.Unlock()
+	if !gotIt {
+		t.Fatalf("Server did not log error on close client")
+	}
+}
+
 func TestSendMsgToSubStoreFailure(t *testing.T) {
 	logger := &checkErrorLogger{checkErrorStr: "add pending message"}
 	opts := GetDefaultOptions()
@@ -506,7 +554,7 @@ func TestSendMsgToSubStoreFailure(t *testing.T) {
 }
 
 func TestClientStoreError(t *testing.T) {
-	logger := &checkErrorLogger{checkErrorStr: "deleting client"}
+	logger := &checkErrorLogger{checkErrorStr: "unregistering client"}
 	opts := GetDefaultOptions()
 	opts.CustomLogger = logger
 	s, err := RunServerWithOpts(opts, nil)
@@ -554,5 +602,137 @@ func TestClientStoreError(t *testing.T) {
 	}
 	if c := s.clients.lookup(clientName); c != nil {
 		t.Fatalf("Unexpected client in server: %v", c)
+	}
+}
+
+type delChannStore struct {
+	stores.Store
+	sync.RWMutex
+	fail bool
+	ch   chan bool
+}
+
+func (ms *delChannStore) DeleteChannel(name string) error {
+	ms.RLock()
+	fail := ms.fail
+	ch := ms.ch
+	ms.RUnlock()
+	defer func() { ch <- true }()
+	if fail {
+		return errOnPurpose
+	}
+	return ms.Store.DeleteChannel(name)
+}
+
+func TestDeleteChannelStoreError(t *testing.T) {
+	opts := GetDefaultOptions()
+	logger := &checkErrorLogger{checkErrorStr: "deleting channel"}
+	opts.CustomLogger = logger
+	opts.StoreLimits.MaxInactivity = 100 * time.Millisecond
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	s.channels.Lock()
+	ms := &delChannStore{Store: s.channels.store, ch: make(chan bool)}
+	s.channels.store = ms
+	s.channels.Unlock()
+
+	testDeleteChannel = true
+	defer func() { testDeleteChannel = false }()
+
+	c, err := s.lookupOrCreateChannel("foo")
+	if err != nil {
+		t.Fatalf("Error creating channel: %v", err)
+	}
+	if c.activity == nil {
+		t.Fatalf("Activity not created")
+	}
+	time.Sleep(2 * opts.StoreLimits.MaxInactivity)
+	// Check for possible lookup while channel is being deleted.
+	if _, err := s.lookupOrCreateChannel("foo"); err != ErrChanDelInProgress {
+		t.Fatalf("Expected error %v, got %v", ErrChanDelInProgress, err)
+	}
+	// Wait to be notified that channel has been deleted
+	if err := Wait(ms.ch); err != nil {
+		t.Fatal("Channel was not deleted")
+	}
+	// Channel should have been deleted and no longer be in map
+	if s.channels.get("foo") != nil {
+		t.Fatalf("Channel should have been removed")
+	}
+	// Check that timer is off
+	s.channels.RLock()
+	dip := c.activity.deleteInProgress
+	tset := c.activity.timerSet
+	s.channels.RUnlock()
+	if !dip {
+		t.Fatalf("DeleteInProgress not expected to have been reset")
+	}
+	if tset {
+		t.Fatalf("Timer should have been stopped")
+	}
+
+	// Don't sleep anymore
+	testDeleteChannel = false
+
+	// Now introduce failure
+	ms.Lock()
+	ms.fail = true
+	ms.Unlock()
+
+	// Create new channel
+	c, err = s.lookupOrCreateChannel("bar")
+	if err != nil {
+		t.Fatalf("Error creating channel: %v", err)
+	}
+	// Wait to be notified that store tried to delete channel
+	if err := Wait(ms.ch); err != nil {
+		t.Fatal("Channel was not deleted")
+	}
+	// We get the notification after the mock DeleteChannel returns the
+	// error, but the server logs the error after that call, so make
+	// sure we give it a chance.
+	waitFor(t, time.Second, 15*time.Millisecond, func() error {
+		logger.Lock()
+		gotIt := logger.gotError
+		logger.Unlock()
+		if !gotIt {
+			return fmt.Errorf("No error about deleting channel was logged")
+		}
+		return nil
+	})
+	// Check that the activity struct has been reset properly
+	s.channels.RLock()
+	dip = c.activity.deleteInProgress
+	tset = c.activity.timerSet
+	s.channels.RUnlock()
+	if dip {
+		t.Fatalf("DeleteInProgress should have been reset")
+	}
+	if !tset {
+		t.Fatalf("Timer should be active")
+	}
+	// Remove failure
+	ms.Lock()
+	ms.fail = false
+	ms.Unlock()
+	// Wait for deletion
+	if err := Wait(ms.ch); err != nil {
+		t.Fatal("Channel was not deleted")
+	}
+	// Channel should have been deleted and no longer be in map
+	if s.channels.get("foo") != nil {
+		t.Fatalf("Channel should have been removed")
+	}
+	// Check that timer is off
+	s.channels.RLock()
+	dip = c.activity.deleteInProgress
+	tset = c.activity.timerSet
+	s.channels.RUnlock()
+	if !dip {
+		t.Fatalf("DeleteInProgress not expected to have been reset")
+	}
+	if tset {
+		t.Fatalf("Timer should have been stopped")
 	}
 }

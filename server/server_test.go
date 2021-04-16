@@ -1,4 +1,15 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2021 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -9,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,13 +29,19 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats-streaming-server/test"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
+
+	_ "github.com/go-sql-driver/mysql"                              // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
+	_ "github.com/nats-io/nats-streaming-server/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
 )
 
 const (
@@ -40,29 +58,62 @@ type tLogger interface {
 var (
 	defaultDataStore    string
 	testLogger          logger.Logger
-	errOnPurpose        = errors.New("On purpose")
+	errOnPurpose        = errors.New("on purpose")
 	benchStoreType      = stores.TypeMemory
 	persistentStoreType = stores.TypeFile
+	testUseEncryption   bool
+	testEncryptionKey   = "testkey"
+)
+
+// The SourceAdmin is used by the test setup to have access
+// to the database server and create the test streaming database.
+// The Source contains the URL that the Store needs to actually
+// connect to the server and use the database.
+const (
+	testDefaultDatabaseName = "test_server_nats_streaming"
+
+	testDefaultMySQLSource      = "nss:password@/" + testDefaultDatabaseName
+	testDefaultMySQLSourceAdmin = "nss:password@/"
+
+	testDefaultPostgresSource      = "sslmode=disable dbname=" + testDefaultDatabaseName
+	testDefaultPostgresSourceAdmin = "sslmode=disable"
+)
+
+var (
+	testSQLDriver       = test.DriverMySQL
+	testSQLSource       = testDefaultMySQLSource
+	testSQLSourceAdmin  = testDefaultMySQLSourceAdmin
+	testSQLDatabaseName = testDefaultDatabaseName
+	testDBSuffixes      = []string{"", "_a", "_b", "_c"}
+	doSQL               = false
 )
 
 func TestMain(m *testing.M) {
 	var (
-		bst string
-		pst string
+		bst         string
+		pst         string
+		sqlCreateDb bool
+		sqlDeleteDb bool
 	)
 	flag.StringVar(&bst, "bench_store", "", "store type for bench tests (mem, file)")
 	flag.StringVar(&pst, "persistent_store", "", "store type for server recovery related tests (file)")
+	// This one is added here so that if we want to disable sql for stores tests
+	// we can use the same param for all packages as in "go test -v ./... -sql=false"
+	flag.Bool("sql", false, "Not used for server tests")
+	// Those 2 sql related flags are handled here, not in AddSQLFlags
+	flag.BoolVar(&sqlCreateDb, "sql_create_db", true, "create sql database on startup")
+	flag.BoolVar(&sqlDeleteDb, "sql_delete_db", true, "delete sql database on exit")
+	flag.BoolVar(&testUseEncryption, "encrypt", false, "use encryption")
+	flag.StringVar(&testEncryptionKey, "encryption_key", string(testEncryptionKey), "encryption key")
+	test.AddSQLFlags(flag.CommandLine, &testSQLDriver, &testSQLSource, &testSQLSourceAdmin, &testSQLDatabaseName)
 	flag.Parse()
-	bst = strings.ToLower(bst)
-	pst = strings.ToLower(pst)
-	// Will add DB store and others when avail
+	bst = strings.ToUpper(bst)
+	pst = strings.ToUpper(pst)
 	switch bst {
 	case "":
 		// use default
-	case "mem":
-		benchStoreType = stores.TypeMemory
-	case "file":
-		benchStoreType = stores.TypeFile
+	case stores.TypeMemory, stores.TypeFile, stores.TypeSQL:
+		benchStoreType = bst
 	default:
 		fmt.Printf("Unknown store %q for bench tests\n", bst)
 		os.Exit(2)
@@ -70,12 +121,46 @@ func TestMain(m *testing.M) {
 	// Will add DB store and others when avail
 	switch pst {
 	case "":
-		// use default
+	// use default
+	case stores.TypeFile, stores.TypeSQL:
+		persistentStoreType = pst
 	default:
 		fmt.Printf("Unknown or unsupported store %q for persistent store server tests\n", pst)
 		os.Exit(2)
 	}
-	os.Exit(m.Run())
+
+	// If either (or both) bench or tests select an SQL store, we need to do
+	// so initializing and cleaning at the end of the test.
+	doSQL = benchStoreType == stores.TypeSQL || persistentStoreType == stores.TypeSQL
+
+	if doSQL {
+		defaultSources := make(map[string][]string)
+		defaultSources[test.DriverMySQL] = []string{testDefaultMySQLSource, testDefaultMySQLSourceAdmin}
+		defaultSources[test.DriverPostgres] = []string{testDefaultPostgresSource, testDefaultPostgresSourceAdmin}
+		if err := test.ProcessSQLFlags(flag.CommandLine, defaultSources); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(2)
+		}
+		if sqlCreateDb {
+			for _, n := range testDBSuffixes {
+				// Create the SQL Database once, the cleanup is simply deleting
+				// content from tables (so we don't have to recreate them).
+				if err := test.CreateSQLDatabase(testSQLDriver, testSQLSourceAdmin,
+					testSQLSource+n, testSQLDatabaseName+n); err != nil {
+					fmt.Printf("Error initializing SQL Datastore: %v", err)
+					os.Exit(2)
+				}
+			}
+		}
+	}
+	ret := m.Run()
+	if doSQL && sqlDeleteDb {
+		// Now that the tests/benchs are done, delete the database
+		for _, n := range testDBSuffixes {
+			test.DeleteSQLDatabase(testSQLDriver, testSQLSourceAdmin, testSQLDatabaseName+n)
+		}
+	}
+	os.Exit(ret)
 }
 
 func init() {
@@ -97,12 +182,19 @@ func init() {
 	// Make the server interpret all our sub's AckWait() as milliseconds instead
 	// of seconds.
 	testAckWaitIsInMillisecond = true
+	// For tests that use FileStore and do message expiration, etc..
+	stores.FileStoreTestSetBackgroundTaskInterval(15 * time.Millisecond)
 }
 
 func stackFatalf(t tLogger, f string, args ...interface{}) {
+	msg := fmt.Sprintf(f, args...) + "\n" + stack()
+	t.Fatalf(msg)
+	// For staticcheck SA0511...
+	panic("unreachable code")
+}
+
+func stack() string {
 	lines := make([]string, 0, 32)
-	msg := fmt.Sprintf(f, args...)
-	lines = append(lines, msg)
 
 	// Generate the Stack of callers:
 	for i := 1; true; i++ {
@@ -114,7 +206,22 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 		lines = append(lines, msg)
 	}
 
-	t.Fatalf("%s", strings.Join(lines, "\n"))
+	return strings.Join(lines, "\n")
+}
+
+func printAllStacks() {
+	size := 1024 * 1024
+	buf := make([]byte, size)
+	n := 0
+	for {
+		n = runtime.Stack(buf, true)
+		if n < size {
+			break
+		}
+		size *= 2
+		buf = make([]byte, size)
+	}
+	fmt.Printf("Go-routines:\n%s\n", string(buf[:n]))
 }
 
 func msgStoreFirstAndLastSequence(t tLogger, ms stores.MsgStore) (uint64, uint64) {
@@ -179,24 +286,35 @@ func checkCount(t tLogger, expected int, f func() (string, int)) {
 	}
 }
 
+// Helper function that waits up to totalWait for the function `f` to return
+// without error. When f returns error, this function sleeps for waitInBetween.
+// At the end of the totalWait, the last reported error from `f` causes the
+// test to fail.
+func waitFor(t tLogger, totalWait, waitInBetween time.Duration, f func() error) {
+	timeout := time.Now().Add(totalWait)
+	var err error
+	for time.Now().Before(timeout) {
+		err = f()
+		if err == nil {
+			return
+		}
+		time.Sleep(waitInBetween)
+	}
+	if err != nil {
+		stackFatalf(t, err.Error())
+	}
+}
+
 // Helper function that waits that the number returned by function `f`
 // is equal to `expected` for a certain period of time, otherwise fails.
 func waitForCount(t tLogger, expected int, f func() (string, int)) {
-	ok := false
-	label := ""
-	count := 0
-	timeout := time.Now().Add(5 * time.Second)
-	for !ok && time.Now().Before(timeout) {
-		label, count = f()
+	waitFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		label, count := f()
 		if count != expected {
-			time.Sleep(10 * time.Millisecond)
-			continue
+			return fmt.Errorf("Timeout waiting to get %v %s, got %v", expected, label, count)
 		}
-		ok = true
-	}
-	if !ok {
-		stackFatalf(t, "Timeout waiting to get %v %s, got %v", expected, label, count)
-	}
+		return nil
+	})
 }
 
 // Helper function that fails if number of clients is not as expected
@@ -231,6 +349,13 @@ func waitForNumSubs(t tLogger, s *StanServer, ID string, expected int) {
 		// We avoid getting a copy of the subscriptions array here
 		// by directly returning the length of the array.
 		c := s.clients.lookup(ID)
+		if c == nil {
+			// Could happen in clustering mode when creation
+			// of channel did not happen yet in a node and test
+			// if checking that node. Just return something different
+			// from expected to cause waitForCount to try again.
+			return "subscriptions", -1
+		}
 		c.RLock()
 		defer c.RUnlock()
 		return "subscriptions", len(c.subs)
@@ -238,21 +363,24 @@ func waitForNumSubs(t tLogger, s *StanServer, ID string, expected int) {
 }
 
 func waitForAcks(t tLogger, s *StanServer, ID string, subID uint64, expected int) {
-	subs := s.clients.getSubs(ID)
 	var sub *subState
-	for _, s := range subs {
-		s.RLock()
-		sID := s.ID
-		s.RUnlock()
-		if sID == subID {
-			sub = s
-			break
+	waitFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+		subs := s.clients.getSubs(ID)
+		for _, s := range subs {
+			s.RLock()
+			sID := s.ID
+			s.RUnlock()
+			if sID == subID {
+				sub = s
+				break
+			}
 		}
-	}
-	if sub == nil {
-		stackFatalf(t, "Subscription %v not found", subID)
-	}
-	waitForCount(t, 0, func() (string, int) {
+		if sub == nil {
+			return fmt.Errorf("Subscription %v not found", subID)
+		}
+		return nil
+	})
+	waitForCount(t, expected, func() (string, int) {
 		sub.RLock()
 		count := len(sub.acksPending)
 		sub.RUnlock()
@@ -281,6 +409,28 @@ func createConnectionWithNatsOpts(t tLogger, clientName string,
 	return sc, nc
 }
 
+func createConfFile(t *testing.T, content []byte) string {
+	t.Helper()
+	conf, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatalf("Error creating conf file: %v", err)
+	}
+	fName := conf.Name()
+	conf.Close()
+	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
+		os.Remove(fName)
+		t.Fatalf("Error writing conf file: %v", err)
+	}
+	return fName
+}
+
+func changeCurrentConfigContentWithNewContent(t *testing.T, curConfig string, content []byte) {
+	t.Helper()
+	if err := ioutil.WriteFile(curConfig, content, 0666); err != nil {
+		t.Fatalf("Error writing config: %v", err)
+	}
+}
+
 func NewDefaultConnection(t tLogger) stan.Conn {
 	sc, err := stan.Connect(clusterName, clientName)
 	if err != nil {
@@ -289,10 +439,15 @@ func NewDefaultConnection(t tLogger) stan.Conn {
 	return sc
 }
 
-func cleanupDatastore(t *testing.T) {
-	if persistentStoreType == stores.TypeFile {
+func cleanupDatastore(t tLogger) {
+	switch persistentStoreType {
+	case stores.TypeFile:
 		if err := os.RemoveAll(defaultDataStore); err != nil {
 			stackFatalf(t, "Error cleaning up datastore: %v", err)
+		}
+	case stores.TypeSQL:
+		for _, n := range testDBSuffixes {
+			test.CleanupSQLDatastore(t, testSQLDriver, testSQLSource+n)
 		}
 	}
 }
@@ -300,9 +455,19 @@ func cleanupDatastore(t *testing.T) {
 func getTestDefaultOptsForPersistentStore() *Options {
 	opts := GetDefaultOptions()
 	opts.StoreType = persistentStoreType
-	if persistentStoreType == stores.TypeFile {
+	switch persistentStoreType {
+	case stores.TypeFile:
 		opts.FilestoreDir = defaultDataStore
 		opts.FileStoreOpts.BufferSize = 1024
+		// Since Go 1.12, on macOS it is very slow to do sync writes...
+		if runtime.GOOS == "darwin" {
+			opts.FileStoreOpts.DoSync = false
+		}
+	case stores.TypeSQL:
+		opts.SQLStoreOpts.Driver = testSQLDriver
+		opts.SQLStoreOpts.Source = testSQLSource
+	default:
+		panic(fmt.Sprintf("Need to specify configuration for store: %q", persistentStoreType))
 	}
 	return opts
 }
@@ -334,19 +499,30 @@ func WaitTime(ch chan bool, timeout time.Duration) error {
 }
 
 func runServerWithOpts(t *testing.T, sOpts *Options, nOpts *natsd.Options) *StanServer {
+	if testUseEncryption {
+		if sOpts == nil {
+			sOpts = GetDefaultOptions()
+		}
+		sOpts.Encrypt = true
+		sOpts.EncryptionKey = []byte(testEncryptionKey)
+	}
 	s, err := RunServerWithOpts(sOpts, nOpts)
 	if err != nil {
 		stackFatalf(t, err.Error())
+	}
+	if testUseEncryption {
+		// Since the key was cleared when creating the crypto store,
+		// restore now for the rest of tests to work properly.
+		sOpts.EncryptionKey = []byte(testEncryptionKey)
 	}
 	return s
 }
 
 func runServer(t *testing.T, clusterName string) *StanServer {
-	s, err := RunServer(clusterName)
-	if err != nil {
-		stackFatalf(t, err.Error())
-	}
-	return s
+	sOpts := GetDefaultOptions()
+	sOpts.ID = clusterName
+	nOpts := DefaultNatsServerOptions
+	return runServerWithOpts(t, sOpts, &nOpts)
 }
 
 type testChannelStoreFailStore struct{ stores.Store }
@@ -371,12 +547,30 @@ func (d *dummyLogger) Debugf(format string, args ...interface{})  { d.log(format
 func (d *dummyLogger) Tracef(format string, args ...interface{})  { d.log(format, args...) }
 func (d *dummyLogger) Errorf(format string, args ...interface{})  { d.log(format, args...) }
 func (d *dummyLogger) Fatalf(format string, args ...interface{})  { d.log(format, args...) }
+func (d *dummyLogger) Warnf(format string, args ...interface{})   { d.log(format, args...) }
+
+func TestVersionMatchesTag(t *testing.T) {
+	tag := os.Getenv("TRAVIS_TAG")
+	if tag == "" {
+		t.SkipNow()
+	}
+	// We expect a tag of the form vX.Y.Z. If that's not the case,
+	// we need someone to have a look. So fail if first letter is not
+	// a `v`
+	if tag[0] != 'v' {
+		t.Fatalf("Expect tag to start with `v`, tag is: %s", tag)
+	}
+	// Strip the `v` from the tag for the version comparison.
+	if VERSION != tag[1:] {
+		t.Fatalf("Version (%s) does not match tag (%s)", VERSION, tag[1:])
+	}
+}
 
 func TestChannelStore(t *testing.T) {
 	s := runServer(t, clusterName)
 	defer s.Shutdown()
 
-	cs := newChannelStore(s.store)
+	cs := newChannelStore(s, s.store)
 	if cs.get("foo") != nil {
 		t.Fatal("Nothing should be returned")
 	}
@@ -416,8 +610,8 @@ func TestChannelStore(t *testing.T) {
 	if _, _, err := cs.msgsState("baz"); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("Channel baz does not exist, call should have failed, got %v", err)
 	}
-	c.store.Msgs.Store([]byte("foo"))
-	c4.store.Msgs.Store([]byte("bar"))
+	c.store.Msgs.Store(&pb.MsgProto{Sequence: 1, Data: []byte("foo")})
+	c4.store.Msgs.Store(&pb.MsgProto{Sequence: 1, Data: []byte("bar")})
 	if n, _, err := cs.msgsState(""); n != 2 || err != nil {
 		t.Fatalf("Expected 2 messages, got %v err=%v", n, err)
 	}
@@ -479,10 +673,28 @@ func TestOptionsClone(t *testing.T) {
 	if _, exist := clone.PerChannel["bar"]; exist {
 		t.Fatal("The channel bar should not be in the cloned options")
 	}
+
+	opts = GetDefaultOptions()
+	opts.Clustering.Peers = []string{"a", "b", "c"}
+	clone = opts.Clone()
+	if !reflect.DeepEqual(opts.Clustering.Peers, clone.Clustering.Peers) {
+		t.Fatalf("Expected %#v, got %#v", opts.Clustering.Peers, clone.Clustering.Peers)
+	}
+	opts.Clustering.Peers[0] = "z"
+	if reflect.DeepEqual(opts.Clustering.Peers, clone.Clustering.Peers) {
+		t.Fatal("Expected clone to be different after original changed, was not")
+	}
 }
 
-func TestGetSubStoreRace(t *testing.T) {
-	numChans := 10000
+func TestConcurrentLookupOfChannels(t *testing.T) {
+	// The original test (TestGetSubStoreRace) was a test to detect a race
+	// that previously existed when creating a channel's subStore. However,
+	// the internal code around that has drastically changed and does not
+	// make that test really relevant. Will keep this to perform concurrent
+	// lookup or create or channels, but lower the number of channels to
+	// 100 (down from 8000) because otherwise with -race, this takes a lot
+	// of memory, slowing down some other tests below...
+	numChans := 100
 
 	opts := GetDefaultOptions()
 	opts.MaxChannels = numChans + 1
@@ -593,246 +805,297 @@ func TestIOChannel(t *testing.T) {
 }
 
 func TestProtocolOrder(t *testing.T) {
-	s := runServer(t, clusterName)
-	defer s.Shutdown()
+	for i := 0; i < 2; i++ {
+		func() {
+			cleanupDatastore(t)
+			defer cleanupDatastore(t)
 
-	sc := NewDefaultConnection(t)
-	defer sc.Close()
+			opts := getTestDefaultOptsForPersistentStore()
+			if i == 1 {
+				opts.Partitioning = true
+				opts.AddPerChannel("foo", &stores.ChannelLimits{})
+				opts.AddPerChannel("bar", &stores.ChannelLimits{})
+				opts.AddPerChannel("baz", &stores.ChannelLimits{})
+			}
+			s := runServerWithOpts(t, opts, nil)
+			defer s.Shutdown()
 
-	for i := 0; i < 10; i++ {
-		if err := sc.Publish("bar", []byte("hello")); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
-	}
+			pubSc := NewDefaultConnection(t)
+			defer pubSc.Close()
 
-	ch := make(chan bool)
-	errCh := make(chan error)
+			total := 1000
+			for i := 0; i < total; i++ {
+				if _, err := pubSc.PublishAsync("baz", []byte("hello"), nil); err != nil {
+					t.Fatalf("Unexpected error on publish: %v", err)
+				}
+			}
+			pubSc.Close()
 
-	recv := int32(0)
-	mode := 0
-	var sc2 stan.Conn
-	cb := func(m *stan.Msg) {
-		count := atomic.AddInt32(&recv, 1)
-		if err := m.Ack(); err != nil {
-			errCh <- err
-			return
-		}
-		if count == 10 {
+			// The barrier for close just guarantees that all the clientPublish
+			// callbacks have been invoked (where we check that the pub message
+			// comes from a valid connection), not that messages have been stored.
+			// We will check the channel's store msgs count but expect that we
+			// may not get the correct count right away.
+			timeout := time.Now().Add(5 * time.Second)
+			count := 0
+			for time.Now().Before(timeout) {
+				c := s.channels.get("baz")
+				if c != nil {
+					count, _ = msgStoreState(t, c.store.Msgs)
+					if count == total {
+						break
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if count != total {
+				t.Fatalf("There should have been %d messages, got %v", total, count)
+			}
+
+			sc := NewDefaultConnection(t)
+			defer sc.Close()
+
+			for i := 0; i < 10; i++ {
+				if err := sc.Publish("bar", []byte("hello")); err != nil {
+					t.Fatalf("Unexpected error on publish: %v", err)
+				}
+			}
+
+			ch := make(chan bool)
+			errCh := make(chan error)
+
+			recv := int32(0)
+			mode := 0
+			var sc2 stan.Conn
+			cb := func(m *stan.Msg) {
+				count := atomic.AddInt32(&recv, 1)
+				if err := m.Ack(); err != nil {
+					errCh <- err
+					return
+				}
+				if count == 10 {
+					var err error
+					switch mode {
+					case 1:
+						err = m.Sub.Unsubscribe()
+					case 2:
+						err = m.Sub.Close()
+					case 3:
+						err = sc2.Close()
+					case 4:
+						err = m.Sub.Unsubscribe()
+						if err == nil {
+							err = sc2.Close()
+						}
+					case 5:
+						err = m.Sub.Close()
+						if err == nil {
+							err = sc2.Close()
+						}
+					}
+					if err != nil {
+						errCh <- err
+					} else {
+						ch <- true
+					}
+				}
+			}
+
+			total = 50
+			// Unsubscribe should not be processed before last processed Ack
+			mode = 1
+			for i := 0; i < total; i++ {
+				atomic.StoreInt32(&recv, 0)
+				if _, err := sc.Subscribe("bar", cb,
+					stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
+					t.Fatalf("Unexpected error on subscribe: %v", err)
+				}
+				// Wait confirmation of received message
+				select {
+				case <-ch:
+				case e := <-errCh:
+					t.Fatal(e)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Timed-out waiting for messages")
+				}
+			}
+			// Subscription close should not be processed before last processed Ack
+			mode = 2
+			for i := 0; i < total; i++ {
+				atomic.StoreInt32(&recv, 0)
+				if _, err := sc.Subscribe("bar", cb,
+					stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
+					t.Fatalf("Unexpected error on subscribe: %v", err)
+				}
+				// Wait confirmation of received message
+				select {
+				case <-ch:
+				case e := <-errCh:
+					t.Fatal(e)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Timed-out waiting for messages")
+				}
+			}
+			// Connection close should not be processed before last processed Ack
+			mode = 3
+			for i := 0; i < total; i++ {
+				atomic.StoreInt32(&recv, 0)
+				conn, err := stan.Connect(clusterName, "otherclient")
+				if err != nil {
+					t.Fatalf("Expected to connect correctly, got err %v", err)
+				}
+				sc2 = conn
+				if _, err := sc2.Subscribe("bar", cb,
+					stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
+					t.Fatalf("Unexpected error on subscribe: %v", err)
+				}
+				// Wait confirmation of received message
+				select {
+				case <-ch:
+				case e := <-errCh:
+					t.Fatal(e)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Timed-out waiting for messages")
+				}
+			}
+			// Connection close should not be processed before unsubscribe and last processed Ack
+			mode = 4
+			for i := 0; i < total; i++ {
+				atomic.StoreInt32(&recv, 0)
+				conn, err := stan.Connect(clusterName, "otherclient")
+				if err != nil {
+					t.Fatalf("Expected to connect correctly, got err %v", err)
+				}
+				sc2 = conn
+				if _, err := sc2.Subscribe("bar", cb,
+					stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
+					t.Fatalf("Unexpected error on subscribe: %v", err)
+				}
+				// Wait confirmation of received message
+				select {
+				case <-ch:
+				case e := <-errCh:
+					t.Fatal(e)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Timed-out waiting for messages")
+				}
+			}
+			// Connection close should not be processed before sub close and last processed Ack
+			mode = 5
+			for i := 0; i < total; i++ {
+				atomic.StoreInt32(&recv, 0)
+				conn, err := stan.Connect(clusterName, "otherclient")
+				if err != nil {
+					t.Fatalf("Expected to connect correctly, got err %v", err)
+				}
+				sc2 = conn
+				if _, err := sc2.Subscribe("bar", cb,
+					stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
+					t.Fatalf("Unexpected error on subscribe: %v", err)
+				}
+				// Wait confirmation of received message
+				select {
+				case <-ch:
+				case e := <-errCh:
+					t.Fatal(e)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Timed-out waiting for messages")
+				}
+			}
+
+			// Mix pub and subscribe calls
+			ch = make(chan bool)
+			errCh = make(chan error, 1)
+			startSubAt := 50
+			var sub stan.Subscription
 			var err error
-			switch mode {
-			case 1:
-				err = m.Sub.Unsubscribe()
-			case 2:
-				err = m.Sub.Close()
-			case 3:
-				err = sc2.Close()
-			case 4:
-				err = m.Sub.Unsubscribe()
-				if err == nil {
-					err = sc2.Close()
+			first := true
+			for i := 1; i <= 100; i++ {
+				if err := sc.Publish("foo", []byte("hello")); err != nil {
+					t.Fatalf("Unexpected error on publish: %v", err)
 				}
-			case 5:
-				err = m.Sub.Close()
-				if err == nil {
-					err = sc2.Close()
+				if i == startSubAt {
+					sub, err = sc.Subscribe("foo", func(m *stan.Msg) {
+						if first {
+							if m.Sequence == uint64(startSubAt)+1 {
+								ch <- true
+							} else {
+								errCh <- fmt.Errorf("Received message %v instead of %v", m.Sequence, startSubAt+1)
+							}
+							first = false
+						}
+					})
+					if err != nil {
+						t.Fatalf("Unexpected error on subscribe: %v", err)
+					}
 				}
 			}
-			if err != nil {
-				errCh <- err
-			} else {
-				ch <- true
+			// Wait confirmation of received message
+			select {
+			case <-ch:
+			case e := <-errCh:
+				t.Fatal(e)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Timed-out waiting for messages")
 			}
-		}
-	}
+			sub.Unsubscribe()
 
-	total := 50
-	// Unsubscribe should not be processed before last processed Ack
-	mode = 1
-	for i := 0; i < total; i++ {
-		atomic.StoreInt32(&recv, 0)
-		if _, err := sc.Subscribe("bar", cb,
-			stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
-			t.Fatalf("Unexpected error on subscribe: %v", err)
-		}
-		// Wait confirmation of received message
-		select {
-		case <-ch:
-		case e := <-errCh:
-			t.Fatal(e)
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed-out waiting for messages")
-		}
-	}
-	// Subscription close should not be processed before last processed Ack
-	mode = 2
-	for i := 0; i < total; i++ {
-		atomic.StoreInt32(&recv, 0)
-		if _, err := sc.Subscribe("bar", cb,
-			stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
-			t.Fatalf("Unexpected error on subscribe: %v", err)
-		}
-		// Wait confirmation of received message
-		select {
-		case <-ch:
-		case e := <-errCh:
-			t.Fatal(e)
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed-out waiting for messages")
-		}
-	}
-	// Connection close should not be processed before last processed Ack
-	mode = 3
-	for i := 0; i < total; i++ {
-		atomic.StoreInt32(&recv, 0)
-		conn, err := stan.Connect(clusterName, "otherclient")
-		if err != nil {
-			t.Fatalf("Expected to connect correctly, got err %v", err)
-		}
-		sc2 = conn
-		if _, err := sc2.Subscribe("bar", cb,
-			stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
-			t.Fatalf("Unexpected error on subscribe: %v", err)
-		}
-		// Wait confirmation of received message
-		select {
-		case <-ch:
-		case e := <-errCh:
-			t.Fatal(e)
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed-out waiting for messages")
-		}
-	}
-	// Connection close should not be processed before unsubscribe and last processed Ack
-	mode = 4
-	for i := 0; i < total; i++ {
-		atomic.StoreInt32(&recv, 0)
-		conn, err := stan.Connect(clusterName, "otherclient")
-		if err != nil {
-			t.Fatalf("Expected to connect correctly, got err %v", err)
-		}
-		sc2 = conn
-		if _, err := sc2.Subscribe("bar", cb,
-			stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
-			t.Fatalf("Unexpected error on subscribe: %v", err)
-		}
-		// Wait confirmation of received message
-		select {
-		case <-ch:
-		case e := <-errCh:
-			t.Fatal(e)
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed-out waiting for messages")
-		}
-	}
-	// Connection close should not be processed before sub close and last processed Ack
-	mode = 5
-	for i := 0; i < total; i++ {
-		atomic.StoreInt32(&recv, 0)
-		conn, err := stan.Connect(clusterName, "otherclient")
-		if err != nil {
-			t.Fatalf("Expected to connect correctly, got err %v", err)
-		}
-		sc2 = conn
-		if _, err := sc2.Subscribe("bar", cb,
-			stan.SetManualAckMode(), stan.DeliverAllAvailable()); err != nil {
-			t.Fatalf("Unexpected error on subscribe: %v", err)
-		}
-		// Wait confirmation of received message
-		select {
-		case <-ch:
-		case e := <-errCh:
-			t.Fatal(e)
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed-out waiting for messages")
-		}
-	}
-
-	// Mix pub and subscribe calls
-	ch = make(chan bool)
-	errCh = make(chan error)
-	startSubAt := 50
-	var sub stan.Subscription
-	var err error
-	for i := 1; i <= 100; i++ {
-		if err := sc.Publish("foo", []byte("hello")); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
-		if i == startSubAt {
-			sub, err = sc.Subscribe("foo", func(m *stan.Msg) {
-				if m.Sequence == uint64(startSubAt)+1 {
-					ch <- true
-				} else if len(errCh) == 0 {
-					errCh <- fmt.Errorf("Received message %v instead of %v", m.Sequence, startSubAt+1)
+			// Acks should be processed before Connection close
+			errCh = make(chan error, 1)
+			for i := 0; i < total; i++ {
+				rcv := int32(0)
+				sc2, err := stan.Connect(clusterName, "otherclient")
+				if err != nil {
+					t.Fatalf("Expected to connect correctly, got err %v", err)
 				}
-			})
-			if err != nil {
-				t.Fatalf("Unexpected error on subscribe: %v", err)
-			}
-		}
-	}
-	// Wait confirmation of received message
-	select {
-	case <-ch:
-	case e := <-errCh:
-		t.Fatal(e)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timed-out waiting for messages")
-	}
-	sub.Unsubscribe()
-
-	// Acks should be processed before Connection close
-	for i := 0; i < total; i++ {
-		rcv := int32(0)
-		sc2, err := stan.Connect(clusterName, "otherclient")
-		if err != nil {
-			t.Fatalf("Expected to connect correctly, got err %v", err)
-		}
-		// Create durable and close connection in cb when
-		// receiving 10th message.
-		if _, err := sc2.Subscribe("foo", func(m *stan.Msg) {
-			if atomic.AddInt32(&rcv, 1) == 10 {
+				// Create durable and close connection in cb when
+				// receiving 10th message.
+				if _, err := sc2.Subscribe("foo", func(m *stan.Msg) {
+					if atomic.AddInt32(&rcv, 1) == 10 {
+						sc2.Close()
+						ch <- true
+					}
+				}, stan.DurableName("dur"), stan.DeliverAllAvailable()); err != nil {
+					t.Fatalf("Error on subscribe: %v", err)
+				}
+				if err := Wait(ch); err != nil {
+					t.Fatal("Did not get our messages")
+				}
+				// Connection is closed at this point. Recreate one
+				sc2, err = stan.Connect(clusterName, "otherclient")
+				if err != nil {
+					t.Fatalf("Expected to connect correctly, got err %v", err)
+				}
+				// Recreate durable and first message should be 10.
+				first := true
+				sub, err = sc2.Subscribe("foo", func(m *stan.Msg) {
+					if first {
+						if m.Redelivered && m.Sequence == 10 {
+							ch <- true
+						} else {
+							errCh <- fmt.Errorf("Unexpected message: %v", m)
+						}
+						first = false
+					}
+				}, stan.DurableName("dur"), stan.DeliverAllAvailable(),
+					stan.MaxInflight(1), stan.SetManualAckMode())
+				if err != nil {
+					t.Fatalf("Error on subscribe: %v", err)
+				}
+				// Wait for ok or error
+				select {
+				case <-ch:
+				case e := <-errCh:
+					t.Fatalf("Error: %v", e)
+				case <-time.After(5 * time.Second):
+					t.Fatal("Timed-out waiting for messages")
+				}
+				if err := sub.Unsubscribe(); err != nil {
+					t.Fatalf("Unexpected error on unsubscribe: %v", err)
+				}
 				sc2.Close()
-				ch <- true
 			}
-		}, stan.DurableName("dur"), stan.DeliverAllAvailable()); err != nil {
-			t.Fatalf("Error on subscribe: %v", err)
-		}
-		if err := Wait(ch); err != nil {
-			t.Fatal("Did not get our messages")
-		}
-		// Connection is closed at this point. Recreate one
-		sc2, err = stan.Connect(clusterName, "otherclient")
-		if err != nil {
-			t.Fatalf("Expected to connect correctly, got err %v", err)
-		}
-		// Recreate durable and first message should be 10.
-		first := true
-		sub, err = sc2.Subscribe("foo", func(m *stan.Msg) {
-			if first {
-				if m.Redelivered && m.Sequence == 10 {
-					ch <- true
-				} else {
-					errCh <- fmt.Errorf("Unexpected message: %v", m)
-				}
-				first = false
-			}
-		}, stan.DurableName("dur"), stan.DeliverAllAvailable(),
-			stan.MaxInflight(1), stan.SetManualAckMode())
-		if err != nil {
-			t.Fatalf("Error on subscribe: %v", err)
-		}
-		// Wait for ok or error
-		select {
-		case <-ch:
-		case e := <-errCh:
-			t.Fatalf("Error: %v", e)
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed-out waiting for messages")
-		}
-		if err := sub.Unsubscribe(); err != nil {
-			t.Fatalf("Unexpected error on unsubscribe: %v", err)
-		}
-		sc2.Close()
+		}()
 	}
 }
 
@@ -891,10 +1154,12 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer nc.Close()
 	sc, err := stan.Connect(clusterName, clientName, stan.NatsConn(nc))
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer sc.Close()
 	// Since server is expected to crash, do not attempt to close sc
 	// because it would delay test by 2 seconds.
 
@@ -915,8 +1180,8 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 
 	m := &pb.MsgProto{}
 	sub.Lock()
+	defer sub.Unlock()
 	s.sendMsgToSub(sub, m, false)
-	sub.Unlock()
 }
 
 func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
@@ -945,7 +1210,7 @@ func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
 	connResponse.Unmarshal(respMsg.Data)
 
 	subSubj := connResponse.SubRequests
-	unsubSubj := connResponse.UnsubRequests
+	subCloseSubj := connResponse.SubCloseRequests
 	pubSubj := connResponse.PubPrefix + ".foo"
 
 	pubMsg := &pb.PubMsg{
@@ -957,302 +1222,94 @@ func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
 		ClientID:      clientName,
 		MaxInFlight:   1024,
 		Subject:       "foo",
-		StartPosition: pb.StartPosition_First,
-		AckWaitInSecs: 30,
+		StartPosition: pb.StartPosition_NewOnly,
+		AckWaitInSecs: 1,
 	}
-	unsubReq := &pb.UnsubscribeRequest{
+	subCloseReq := &pb.UnsubscribeRequest{
 		ClientID: clientName,
 		Subject:  "foo",
 	}
-	for i := 0; i < 100; i++ {
-		// Use the same subscriber for subscription request response and data,
-		// so we can reliably check if data comes before response.
-		inbox := nats.NewInbox()
-		sub, err := nc.SubscribeSync(inbox)
-		if err != nil {
-			t.Fatalf("Unable to create nats subscriber: %v", err)
-		}
-		subReq.Inbox = inbox
-		bytes, _ := subReq.Marshal()
-		// Send the request with inbox as the Reply
-		if err := nc.PublishRequest(subSubj, inbox, bytes); err != nil {
-			t.Fatalf("Error sending request: %v", err)
-		}
-		// Followed by a data message
-		pubMsg.Guid = nuid.Next()
-		bytes, _ = pubMsg.Marshal()
-		if err := nc.Publish(pubSubj, bytes); err != nil {
-			t.Fatalf("Error sending msg: %v", err)
-		}
-		nc.Flush()
-		// Dequeue
-		msg, err := sub.NextMsg(2 * time.Second)
-		if err != nil {
-			t.Fatalf("Did not get our message: %v", err)
-		}
-		// It should always be the subscription response!!!
-		msgProto := &pb.MsgProto{}
-		err = msgProto.Unmarshal(msg.Data)
-		if err == nil && msgProto.Sequence != 0 {
-			t.Fatalf("Iter=%v - Did not receive valid subscription response: %#v - %v", (i + 1), msgProto, err)
-		}
-		subReqResp := &pb.SubscriptionResponse{}
-		subReqResp.Unmarshal(msg.Data)
-		unsubReq.Inbox = subReqResp.AckInbox
-		bytes, _ = unsubReq.Marshal()
-		if err := nc.Publish(unsubSubj, bytes); err != nil {
-			t.Fatalf("Unable to send unsub request: %v", err)
-		}
-		sub.Unsubscribe()
-	}
-}
-
-func TestPersistentStoreAcksPool(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
-
-	opts := getTestDefaultOptsForPersistentStore()
-	opts.AckSubsPoolSize = 5
-	s := runServerWithOpts(t, opts, nil)
-	defer shutdownRestartedServerOnTestExit(&s)
-
-	var allSubs []stan.Subscription
-
-	// Check server's ackSub pool
-	checkPoolSize := func() {
-		s.mu.RLock()
-		poolSize := len(s.acksSubs)
-		s.mu.RUnlock()
-		if poolSize != opts.AckSubsPoolSize {
-			stackFatalf(t, "Expected acksSubs pool size to be %v, got %v", opts.AckSubsPoolSize, poolSize)
-		}
-	}
-	checkPoolSize()
-
-	// Check total subs and each sub's ackSub is pooled or not as expected.
-	checkAckSubs := func(total int32, checkSubFunc func(sub *subState) error) {
-		subs := s.clients.getSubs(clientName)
-		if len(subs) != int(total) {
-			stackFatalf(t, "Expected %d subs, got %v", total, len(subs))
-		}
-		for _, sub := range subs {
-			sub.RLock()
-			err := checkSubFunc(sub)
-			sub.RUnlock()
-			if err != nil {
-				stackFatalf(t, err.Error())
-			}
-		}
-	}
-
-	sc, nc := createConnectionWithNatsOpts(t, clientName,
-		nats.ReconnectWait(100*time.Millisecond))
-	defer nc.Close()
-	defer sc.Close()
-
-	totalSubs := int32(10)
-	ch := make(chan bool)
-	count := int32(0)
-	cb := func(m *stan.Msg) {
-		if !m.Redelivered && atomic.AddInt32(&count, 1) == atomic.LoadInt32(&totalSubs) {
-			ch <- true
-		}
-	}
-	// Create 10 subs
-	for i := 0; i < int(totalSubs); i++ {
-		sub, err := sc.Subscribe("foo", cb, stan.AckWait(ackWaitInMs(50)))
-		if err != nil {
-			t.Fatalf("Unexpected error on subscribe: %v", err)
-		}
-		allSubs = append(allSubs, sub)
-	}
-	checkReceived := func(subs int32) {
-		atomic.StoreInt32(&count, 0)
-		atomic.StoreInt32(&totalSubs, subs)
-		// Send 1 message
-		if err := sc.Publish("foo", []byte("hello")); err != nil {
-			stackFatalf(t, "Unexpected error on publish: %v", err)
-		}
-		// Wait for all messages to be received
-		if err := Wait(ch); err != nil {
-			stackFatalf(t, "Did not get our messages")
-		}
-		cs := channelsGet(t, s.channels, "foo")
-		cs.ss.RLock()
-		subsArray := cs.ss.psubs
-		cs.ss.RUnlock()
-		timeout := time.Now().Add(2 * time.Second)
-		ap := false
-		for time.Now().Before(timeout) {
-			for _, s := range subsArray {
-				s.RLock()
-				ap = len(s.acksPending) > 0
-				s.RUnlock()
-				if ap {
-					break
+	tsubQueueName := []string{"", "queue"}
+	tsubDurName := []string{"", "dur"}
+	for _, qname := range tsubQueueName {
+		for _, dname := range tsubDurName {
+			for i := 0; i < 2; i++ {
+				// Use the same subscriber for subscription request response and data,
+				// so we can reliably check if data comes before response.
+				inbox := nats.NewInbox()
+				sub, err := nc.SubscribeSync(inbox)
+				if err != nil {
+					t.Fatalf("Unable to create nats subscriber: %v", err)
 				}
-			}
-			if ap {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			} else {
-				break
-			}
-		}
-		if ap {
-			stackFatalf(t, "Unexpected unacknowledged messages")
-		}
-	}
-	checkReceived(totalSubs)
-	// Check that server's subs have nil ackSub
-	checkAckSubs(totalSubs, func(sub *subState) error {
-		if sub.ackSub != nil {
-			return fmt.Errorf("Expected ackSub for sub %v to be nil, was not", sub.ID)
-		}
-		return nil
-	})
-	// Stop server and restart with lower pool size
-	s.Shutdown()
-	opts.AckSubsPoolSize = 2
-	s = runServerWithOpts(t, opts, nil)
-	// Check server's ackSub pool
-	checkPoolSize()
-	// Check that AckInbox with ackSubIndex > AcksPoolSize-1 have
-	// individual ackSub
-	checkAckSubs(totalSubs, func(sub *subState) error {
-		wantsNil := false
-		ackSubIndexEnd := strings.Index(sub.AckInbox, ".")
-		if n, _ := strconv.Atoi(sub.AckInbox[:ackSubIndexEnd]); n <= 1 {
-			wantsNil = true
-		}
-		if wantsNil && sub.ackSub != nil {
-			return fmt.Errorf("Expected ackSub for sub %v to be nil, was not", sub.ID)
-		} else if !wantsNil && sub.ackSub == nil {
-			return fmt.Errorf("Expected ackSub for sub %v to be not nil, was nil", sub.ID)
-		}
-		return nil
-	})
-	checkReceived(totalSubs)
-	// Restart server with no acksSub pool
-	s.Shutdown()
-	opts.AckSubsPoolSize = 0
-	s = runServerWithOpts(t, opts, nil)
-	// Check server's ackSub pool
-	checkPoolSize()
-	// Check that all subs have an individual ackSub
-	checkAckSubs(totalSubs, func(sub *subState) error {
-		if sub.ackSub == nil {
-			return fmt.Errorf("Expected ackSub for sub %v to be not nil, was nil", sub.ID)
-		}
-		return nil
-	})
-	checkReceived(totalSubs)
-	// Add another subscriber
-	sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {})
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-	allSubs = append(allSubs, sub)
-	// Restart server
-	s.Shutdown()
-	s = runServerWithOpts(t, opts, nil)
-	// Check that the new sub's AckInbox is _INBOX as usual.
-	checkAckSubs(totalSubs+1, func(sub *subState) error {
-		if int(sub.ID) > int(totalSubs) {
-			if sub.AckInbox[:len(nats.InboxPrefix)] != nats.InboxPrefix {
-				return fmt.Errorf("Unexpected AckInbox: %v", sub)
+				subReq.Inbox = inbox
+				subReq.QGroup = qname
+				subReq.DurableName = dname
+				bytes, _ := subReq.Marshal()
+				// Send the request with inbox as the Reply
+				if err := nc.PublishRequest(subSubj, inbox, bytes); err != nil {
+					t.Fatalf("Error sending request: %v", err)
+				}
+				// Followed by a data message
+				pubMsg.Guid = nuid.Next()
+				bytes, _ = pubMsg.Marshal()
+				if err := nc.Publish(pubSubj, bytes); err != nil {
+					t.Fatalf("Error sending msg: %v", err)
+				}
+				nc.Flush()
+				// Dequeue
+				msg, err := sub.NextMsg(2 * time.Second)
+				if err != nil {
+					t.Fatalf("Did not get our message: %v", err)
+				}
+				// It should always be the subscription response!!!
+				msgProto := &pb.MsgProto{}
+				err = msgProto.Unmarshal(msg.Data)
+				if err == nil && msgProto.Sequence != 0 {
+					t.Fatalf("Queue %q - Durable %q - Invalid subscription create response: %#v - %v",
+						qname, dname, msgProto, err)
+				}
+				subReqResp := &pb.SubscriptionResponse{}
+				if err := subReqResp.Unmarshal(msg.Data); err != nil {
+					t.Fatalf("Queue %q - Durable %q - Invalid subscription create response: %v",
+						qname, dname, err)
+				}
+				if subReqResp.Error != "" {
+					t.Fatalf("Received response error: %q", subReqResp.Error)
+				}
+				// If the message arrived just before the
+				// subscription request, and since we ask for
+				// new-only, it is possible that there is no
+				// message. Asking for all avail is not good for
+				// this test since - for durables - it would test
+				// the newOnHold more than the initialized flag.
+				msg, err = sub.NextMsg(time.Second)
+				if err == nil {
+					if err := msgProto.Unmarshal(msg.Data); err != nil {
+						t.Fatalf("Invalid message: %v", err)
+					}
+					ackReq := &pb.Ack{
+						Sequence: msgProto.Sequence,
+						Subject:  msgProto.Subject,
+					}
+					bytes, _ = ackReq.Marshal()
+					nc.Publish(subReqResp.AckInbox, bytes)
+				}
+				subCloseReq.Inbox = subReqResp.AckInbox
+				bytes, _ = subCloseReq.Marshal()
+				msg, err = nc.Request(subCloseSubj, bytes, 2*time.Second)
+				if err != nil {
+					t.Fatalf("Unable to send unsub request: %v", err)
+				}
+				subCloseResp := &pb.SubscriptionResponse{}
+				if err := subCloseResp.Unmarshal(msg.Data); err != nil {
+					t.Fatalf("Invalid subscription close response: %v", err)
+				}
+				if subCloseResp.Error != "" {
+					t.Fatalf("Error on close: %q", subCloseResp.Error)
+				}
+				sub.Unsubscribe()
 			}
 		}
-		if sub.ackSub == nil {
-			return fmt.Errorf("Expected ackSub for sub %v to be not nil, was nil", sub.ID)
-		}
-		return nil
-	})
-	// Restart server with ackPool
-	s.Shutdown()
-	opts.AckSubsPoolSize = 2
-	s = runServerWithOpts(t, opts, nil)
-	// Check server's ackSub pool
-	checkPoolSize()
-	// Check that unsubscribe work ok
-	for _, sub := range allSubs {
-		if err := sub.Unsubscribe(); err != nil {
-			t.Fatalf("Error on unsubscribe: %v", err)
-		}
-	}
-	// Create a subscription without call unsubscribe and make
-	// sure it does not prevent closing of connection.
-	if _, err := sc.Subscribe("foo", cb, stan.AckWait(ackWaitInMs(15))); err != nil {
-		t.Fatalf("Error on subscribe: %v", err)
-	}
-	checkReceived(1)
-	// Close the client connection
-	sc.Close()
-	nc.Close()
-	// Make sure connection close is correctly processed.
-	waitForNumClients(t, s, 0)
-}
-
-func TestAckSubsSubjectsInPoolUseUniqueSubject(t *testing.T) {
-	opts := GetDefaultOptions()
-	opts.ID = clusterName
-	opts.AckSubsPoolSize = 1
-	s1 := runServerWithOpts(t, opts, nil)
-	defer s1.Shutdown()
-
-	opts.NATSServerURL = nats.DefaultURL
-	opts.ID = "otherCluster"
-	s2 := runServerWithOpts(t, opts, nil)
-	defer s2.Shutdown()
-
-	sc1 := NewDefaultConnection(t)
-	defer sc1.Close()
-
-	if _, err := sc1.Subscribe("foo", func(m *stan.Msg) {}); err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-
-	sc2, err := stan.Connect("otherCluster", "otherClient")
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer sc2.Close()
-
-	// Create a subscription with manual ack, and ack after message is
-	// redelivered.
-	cb := func(m *stan.Msg) {
-		if m.Redelivered {
-			m.Ack()
-		}
-	}
-	if _, err := sc2.Subscribe("foo", cb,
-		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(15))); err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-
-	// Produce 1 message for each connection
-	if err := sc1.Publish("foo", []byte("hello s1")); err != nil {
-		t.Fatalf("Unexpected error on publish: %v", err)
-	}
-	if err := sc2.Publish("foo", []byte("hello s2")); err != nil {
-		t.Fatalf("Unexpected error on publish: %v", err)
-	}
-
-	// Wait for ack of sc2 to be processed by s2
-	waitForAcks(t, s2, "otherClient", 1, 0)
-
-	s1.mu.Lock()
-	s1AcksReceived, _ := s1.acksSubs[0].Delivered()
-	s1.mu.Unlock()
-	if s1AcksReceived != 1 {
-		t.Fatalf("Expected pooled ack sub to receive only 1 message, got %v", s1AcksReceived)
-	}
-	s2.mu.Lock()
-	s2AcksReceived, _ := s2.acksSubs[0].Delivered()
-	s2.mu.Unlock()
-	if s2AcksReceived != 1 {
-		t.Fatalf("Expected pooled ack sub to receive only 1 message, got %v", s2AcksReceived)
 	}
 }
 
@@ -1297,4 +1354,354 @@ func TestAckForUnknownChannel(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("Server did not log error about not finding channel")
+}
+
+func TestAckProcessedBeforeClose(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	ch := make(chan bool, 1)
+	for i := 0; i < 50; i++ {
+		if _, err := sc.Subscribe("foo",
+			func(m *stan.Msg) {
+				m.Ack()
+				m.Sub.Close()
+				ch <- true
+			},
+			stan.DeliverAllAvailable(),
+			stan.DurableName("dur"),
+			stan.SetManualAckMode()); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		if err := Wait(ch); err != nil {
+			t.Fatal("Did not get our message")
+		}
+		pc := 0
+		cs := s.channels.get("foo")
+		cs.ss.RLock()
+		for _, dur := range cs.ss.durables {
+			pc = len(dur.acksPending)
+		}
+		cs.ss.RUnlock()
+		if pc != 0 {
+			t.Fatalf("Did not expect pending messages, got %v", pc)
+		}
+		dur, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+		if err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		dur.Unsubscribe()
+	}
+}
+
+func TestServerRandomPort(t *testing.T) {
+	natsOpts := natsdTest.DefaultTestOptions
+	natsOpts.Port = natsd.RANDOM_PORT
+	opts := GetDefaultOptions()
+	s := runServerWithOpts(t, opts, &natsOpts)
+	defer s.Shutdown()
+
+	if natsOpts.Port == natsd.RANDOM_PORT {
+		t.Fatal("port was not updated")
+	}
+	s.Shutdown()
+
+	// Try with no nats options provided to make sure we don't
+	// access natsOpts without checking that it is not nil
+	s = runServerWithOpts(t, opts, nil)
+	s.Shutdown()
+}
+
+func TestServerRandomClientURL(t *testing.T) {
+	// Try with an embedded server.
+	natsOpts := natsdTest.DefaultTestOptions
+	natsOpts.Port = natsd.RANDOM_PORT
+	opts := GetDefaultOptions()
+	s := runServerWithOpts(t, opts, &natsOpts)
+	clientURL := s.ClientURL()
+	defer s.Shutdown()
+
+	re := regexp.MustCompile(":[0-9]+$")
+	portString := re.FindString(clientURL)
+	if len(portString) == 3 {
+		t.Fatal("could not locate port in clientURL")
+	}
+
+	urlPort, err := strconv.Atoi(portString[1:])
+	if err != nil {
+		t.Fatal("failed to convert clientURL to integer")
+	}
+
+	if natsOpts.Port != urlPort {
+		t.Fatal("options port did not match clientURL port")
+	}
+	s.Shutdown()
+
+	// Try with remote server
+	natsOpts = natsdTest.DefaultTestOptions
+	natsOpts.Port = natsd.RANDOM_PORT
+	ns := natsdTest.RunServer(&natsOpts)
+	defer ns.Shutdown()
+
+	opts.NATSServerURL = fmt.Sprintf("nats://%s:%d", natsOpts.Host, natsOpts.Port)
+	s = runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	clientURL = s.ClientURL()
+	portString = re.FindString(clientURL)
+	if len(portString) == 3 {
+		t.Fatal("could not locate port in clientURL")
+	}
+
+	urlPort, err = strconv.Atoi(portString[1:])
+	if err != nil {
+		t.Fatal("failed to convert clientURL to integer")
+	}
+
+	if natsOpts.Port != urlPort {
+		t.Fatal("options port did not match clientURL port")
+	}
+}
+
+func TestServerAuthInConfig(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		authorization {
+			users [
+				{user: foo, password: bar}
+			]
+		}
+		streaming {
+			username: foo
+			password: bar
+		}
+	`))
+	defer os.Remove(conf)
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	noPrint := func() {}
+	sopts, nopts, err := ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s := runServerWithOpts(t, sopts, nopts)
+	s.Shutdown()
+	s = nil
+
+	// Check that command line still takes precedence
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf, "-user", "foo", "-pass", "wrong"}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s, err = RunServerWithOpts(sopts, nopts)
+	if err == nil {
+		if s != nil {
+			s.Shutdown()
+		}
+		t.Fatal("Expected to fail to start")
+	}
+
+	conf = createConfFile(t, []byte(`
+		authorization {
+			token: mytoken
+		}
+		streaming {
+			token: mytoken
+		}
+	`))
+	defer os.Remove(conf)
+
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s = runServerWithOpts(t, sopts, nopts)
+	s.Shutdown()
+
+	// For token, the authorization{ token: <value> } is replaced with value passed by `-auth`
+	// and also used to connect. So the test here shows that if `-auth` is specified, it
+	// will both use this as the authentication token and use that to create the connections.
+	// We show that streaming { token: wrong } does not prevent from running.
+	conf = createConfFile(t, []byte(`
+		streaming {
+			token: ignored_because_command_line_is_used
+		}
+	`))
+	defer os.Remove(conf)
+
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf, "-auth", "realtoken"}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s = runServerWithOpts(t, sopts, nopts)
+	defer s.Shutdown()
+
+	// Check that NATS connection really need to provide "realtoken" as authentication token.
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err == nil {
+		if nc != nil {
+			nc.Close()
+		}
+		t.Fatal("Should not have connected")
+	}
+	nc, err = nats.Connect(nats.DefaultURL, nats.Token("realtoken"))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	nc.Close()
+}
+
+func TestServerAuthNKey(t *testing.T) {
+	nkeyfile := createConfFile(t, []byte(`
+-----BEGIN USER NKEY SEED-----
+SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY
+------END USER NKEY SEED------
+	`))
+	defer os.Remove(nkeyfile)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		authorization {
+			users [
+				# Streaming Server
+				{nkey: UDXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4}
+				# Some other user
+				{nkey: UCNGL4W5QX66CFX6A6DCBVDH5VOHMI7B2UZZU7TXAUQQSI2JPHULCKBR}
+			]
+		}
+		streaming {
+			nkey_seed_file: '%s'
+		}
+	`, nkeyfile)))
+	defer os.Remove(conf)
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	noPrint := func() {}
+	sopts, nopts, err := ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s := runServerWithOpts(t, sopts, nopts)
+	s.Shutdown()
+	s = nil
+
+	// Check that it fails with wrong seed
+	changeCurrentConfigContentWithNewContent(t, nkeyfile, []byte(`
+-----BEGIN USER NKEY SEED-----
+SUAKYRHVIOREXV7EUZTBHUHL7NUMHPMAS7QMDU3GTIUWEI5LDNOXD43IZY
+------END USER NKEY SEED------
+	`))
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s, err = RunServerWithOpts(sopts, nopts)
+	if err == nil {
+		if s != nil {
+			s.Shutdown()
+		}
+		t.Fatal("Expected failure to start")
+	}
+}
+
+func TestFileSliceMaxBytesCmdLine(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	noPrint := func() {}
+	sopts, nopts, err := ConfigureOptions(fs, []string{"-store", "file", "-dir", defaultDataStore, "-file_slice_max_bytes", "0"}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s := runServerWithOpts(t, sopts, nopts)
+	defer s.Shutdown()
+
+	s.mu.Lock()
+	smb := s.opts.FileStoreOpts.SliceMaxBytes
+	s.mu.Unlock()
+	if smb != 0 {
+		t.Fatalf("Expected value to be 0, got %v", smb)
+	}
+}
+
+func TestInternalSubsLimits(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	for _, test := range []struct {
+		name string
+		opts func() *Options
+	}{
+		{"regular", func() *Options { return GetDefaultOptions() }},
+		{"partition", func() *Options {
+			o := GetDefaultOptions()
+			o.Partitioning = true
+			o.AddPerChannel("foo", &stores.ChannelLimits{})
+			o.AddPerChannel("bar", &stores.ChannelLimits{})
+			return o
+		}},
+		{"ft", func() *Options { return getTestFTDefaultOptions() }},
+		{"clustered", func() *Options { return getTestDefaultOptsForClustering("a", true) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "clustered" {
+				ns := natsdTest.RunDefaultServer()
+				defer ns.Shutdown()
+			}
+			o := test.opts()
+			s := runServerWithOpts(t, o, nil)
+			defer s.Shutdown()
+
+			switch test.name {
+			case "clustered":
+				getLeader(t, time.Second, s)
+			case "ft":
+				getFTActiveServer(t, s)
+			default:
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			subs := []*nats.Subscription{
+				s.connectSub,
+				s.pubSub,
+				s.subUnsubSub,
+				s.subCloseSub,
+				s.closeSub,
+				s.cliPingSub,
+				s.addNodeSub,
+				s.rmNodeSub,
+			}
+			for _, sub := range subs {
+				// sub can be nil depending on the running mode.
+				if sub == nil {
+					continue
+				}
+				if count, sz, err := sub.PendingLimits(); err != nil || count != -1 || sz != -1 {
+					t.Fatalf("Unexpected values for sub on %q: err=%v count=%v sz=%v",
+						sub.Subject, err, count, sz)
+				}
+			}
+			// The subscription on "client subscription requests" should not be unlimited.
+			if count, sz, err := s.subSub.PendingLimits(); err != nil || count == -1 || sz == -1 {
+				t.Fatalf("The subSub subscription should not be unlimited: err=%v count=%v sz=%v", err, count, sz)
+			}
+		})
+	}
 }

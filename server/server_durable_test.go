@@ -1,16 +1,29 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package server
 
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func TestDurableRestartWithMaxInflight(t *testing.T) {
@@ -69,19 +82,20 @@ func TestDurableRestartWithMaxInflight(t *testing.T) {
 }
 
 func checkDurable(t *testing.T, s *StanServer, channel, durName, durKey string) {
+	t.Helper()
 	c := s.clients.lookup(clientName)
 	if c == nil {
-		stackFatalf(t, "Expected client %v to be registered", clientName)
+		t.Fatalf("Expected client %v to be registered", clientName)
 	}
 	c.RLock()
 	subs := c.subs
 	c.RUnlock()
 	if len(subs) != 1 {
-		stackFatalf(t, "Expected 1 sub, got %v", len(subs))
+		t.Fatalf("Expected 1 sub, got %v", len(subs))
 	}
 	sub := subs[0]
 	if sub.DurableName != durName {
-		stackFatalf(t, "Expected durable name %v, got %v", durName, sub.DurableName)
+		t.Fatalf("Expected durable name %v, got %v", durName, sub.DurableName)
 	}
 	// Check that durable is also in subStore
 	cs := channelsGet(t, s.channels, channel)
@@ -90,7 +104,7 @@ func checkDurable(t *testing.T, s *StanServer, channel, durName, durKey string) 
 	durInSS := ss.durables[durKey]
 	ss.RUnlock()
 	if durInSS == nil || durInSS.DurableName != durName {
-		stackFatalf(t, "Expected durable to be in subStore")
+		t.Fatalf("Expected durable to be in subStore")
 	}
 }
 
@@ -287,7 +301,7 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 	}
 
 	// Verify message is acked.
-	checkDurableNoPendingAck(t, s, true, ackInbox, ackSub, 1)
+	checkDurableNoPendingAck(t, s, true, ackInbox, ackSub, 1, "foo")
 
 	// Close stan connection
 	sc.Close()
@@ -310,7 +324,7 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 	}
 
 	// Verify that we have different AckInbox and ackSub and message is acked.
-	checkDurableNoPendingAck(t, s, false, ackInbox, ackSub, 2)
+	checkDurableNoPendingAck(t, s, false, ackInbox, ackSub, 2, "foo")
 
 	// Close stan connection
 	sc.Close()
@@ -328,7 +342,7 @@ func TestDurableAckedMsgNotRedelivered(t *testing.T) {
 	checkDurable(t, s, "foo", durName, durKey)
 
 	// Verify that we have different AckInbox and ackSub and message is acked.
-	checkDurableNoPendingAck(t, s, false, ackInbox, ackSub, 2)
+	checkDurableNoPendingAck(t, s, false, ackInbox, ackSub, 2, "foo")
 
 	numMsgs := len(msgs)
 	if numMsgs > 2 {
@@ -387,7 +401,8 @@ func TestDurableRemovedOnUnsubscribe(t *testing.T) {
 }
 
 func checkDurableNoPendingAck(t *testing.T, s *StanServer, isSame bool,
-	ackInbox string, ackSub *nats.Subscription, expectedSeq uint64) {
+	ackInbox string, ackSub *nats.Subscription, expectedSeq uint64, channel string) {
+
 	// When called, we know that there is 1 sub, and the sub is a durable.
 	subs := s.clients.getSubs(clientName)
 	durable := subs[0]
@@ -403,6 +418,7 @@ func checkDurableNoPendingAck(t *testing.T, s *StanServer, isSame bool,
 		if durAckSub != ackSub {
 			stackFatalf(t, "Expected subscriber on ack to be %p, got %p", ackSub, durAckSub)
 		}
+
 	} else {
 		if durAckInbox == ackInbox {
 			stackFatalf(t, "Expected different ackInbox'es")
@@ -634,6 +650,7 @@ func TestDurableClosedNotUnsubscribed(t *testing.T) {
 }
 
 func closeSubscriber(t *testing.T, subType string) {
+	t.Helper()
 	s := runServer(t, clusterName)
 	defer s.Shutdown()
 
@@ -641,7 +658,7 @@ func closeSubscriber(t *testing.T, subType string) {
 	defer sc.Close()
 
 	if err := sc.Publish("foo", []byte("msg")); err != nil {
-		stackFatalf(t, "Unexpected error on publish: %v", err)
+		t.Fatalf("Unexpected error on publish: %v", err)
 	}
 	// Create a durable
 	durName := "dur"
@@ -673,15 +690,15 @@ func closeSubscriber(t *testing.T, subType string) {
 			stan.DurableName(durName))
 	}
 	if err != nil {
-		stackFatalf(t, "Unexpected error on subscribe: %v", err)
+		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	wait := func() {
 		select {
 		case <-errCh:
-			stackFatalf(t, "Unexpected message received")
+			t.Fatalf("Unexpected message received")
 		case <-ch:
 		case <-time.After(5 * time.Second):
-			stackFatalf(t, "Did not get our message")
+			t.Fatalf("Did not get our message")
 		}
 	}
 	wait()
@@ -697,13 +714,13 @@ func closeSubscriber(t *testing.T, subType string) {
 	}
 	s.mu.RUnlock()
 	if dur == nil {
-		stackFatalf(t, "Durable should have been found")
+		t.Fatalf("Durable should have been found")
 	}
 	// Make sure ACKs are processed before closing to avoid redelivery
 	waitForAcks(t, s, clientName, dur.ID, 0)
 	// Close durable, don't unsubscribe it
 	if err := sub.Close(); err != nil {
-		stackFatalf(t, "Error on subscriber close: %v", err)
+		t.Fatalf("Error on subscriber close: %v", err)
 	}
 	// Durable should still be present
 	ss.RLock()
@@ -715,11 +732,11 @@ func closeSubscriber(t *testing.T, subType string) {
 	}
 	ss.RUnlock()
 	if !there {
-		stackFatalf(t, "Durable should still be present")
+		t.Fatalf("Durable should still be present")
 	}
 	// Send second message
 	if err := sc.Publish("foo", []byte("msg")); err != nil {
-		stackFatalf(t, "Unexpected error on publish: %v", err)
+		t.Fatalf("Unexpected error on publish: %v", err)
 	}
 	// Restart the durable
 	if subType == "sub" {
@@ -737,7 +754,7 @@ func closeSubscriber(t *testing.T, subType string) {
 	wait()
 	// Unsubscribe for good
 	if err := sub.Unsubscribe(); err != nil {
-		stackFatalf(t, "Unexpected error on unsubscribe")
+		t.Fatalf("Unexpected error on unsubscribe")
 	}
 	// Wait for unsub to be fully processed
 	waitForNumSubs(t, s, clientName, 0)
@@ -750,7 +767,7 @@ func closeSubscriber(t *testing.T, subType string) {
 	}
 	ss.RUnlock()
 	if there {
-		stackFatalf(t, "Durable should not be present")
+		t.Fatalf("Durable should not be present")
 	}
 }
 
@@ -808,6 +825,7 @@ func TestNewOnHoldSetOnDurableRestart(t *testing.T) {
 	stop := make(chan struct{})
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	errCh := make(chan error, 1)
 	go func() {
 		defer wg.Done()
 		for {
@@ -816,7 +834,11 @@ func TestNewOnHoldSetOnDurableRestart(t *testing.T) {
 				return
 			default:
 				if err := sc.Publish("foo", []byte("hello")); err != nil {
-					t.Fatalf("Unexpected error on publish: %v", err)
+					select {
+					case errCh <- fmt.Errorf("Unexpected error on publish: %v", err):
+						return
+					default:
+					}
 				}
 			}
 		}
@@ -838,6 +860,11 @@ func TestNewOnHoldSetOnDurableRestart(t *testing.T) {
 	// Check our success
 	if failed {
 		t.Fatal("Did not receive the redelivered messages first")
+	}
+	select {
+	case e := <-errCh:
+		t.Fatal(e.Error())
+	default:
 	}
 }
 
@@ -891,4 +918,54 @@ func TestPersistentStoreDurableClosedStatusOnRestart(t *testing.T) {
 	checkSubs(t, s, clientName, 0)
 	// Restart one last time
 	dur = restartDurable()
+}
+
+func TestDurableReplaced(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.ReplaceDurable = true
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	testDurableReplaced(t, s)
+}
+
+func testDurableReplaced(t *testing.T, s *StanServer) {
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	count := int32(0)
+	cb := func(_ *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+	}
+	dur1, err := sc.Subscribe("foo", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Unable to start durable: %v", err)
+	}
+
+	dur2, err := sc.Subscribe("foo", cb, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Unable to start durable: %v", err)
+	}
+
+	sc.Publish("foo", []byte("msg"))
+	time.Sleep(150 * time.Millisecond)
+
+	if c := atomic.LoadInt32(&count); c != 1 {
+		t.Fatalf("Received %v messages!", c)
+	}
+
+	c, err := s.lookupOrCreateChannel("foo")
+	if err != nil {
+		t.Fatalf("Error on lookup: %v", err)
+	}
+	if subs := c.ss.getAllSubs(); len(subs) > 1 {
+		t.Fatalf("Should have only 1 sub, got %v", len(subs))
+	}
+
+	if err := dur1.Close(); err == nil {
+		t.Fatal("Expected error on close of dur1, but did not get one")
+	}
+	if err := dur2.Close(); err != nil {
+		t.Fatalf("Error on close: %v", err)
+	}
 }

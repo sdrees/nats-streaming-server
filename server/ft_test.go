@@ -1,4 +1,15 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2017-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -13,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
 )
 
 // A mock store that we use to override GetExclusiveLock() behavior.
@@ -62,9 +73,24 @@ func setFTTestsHBInterval() {
 }
 
 func getTestFTDefaultOptions() *Options {
-	opts := getTestDefaultOptsForPersistentStore()
+	// We support only FileStore for now, so set the options directly here.
+	opts := GetDefaultOptions()
+	opts.StoreType = persistentStoreType
+	if persistentStoreType == stores.TypeFile {
+		opts.FilestoreDir = defaultDataStore
+		opts.FileStoreOpts.BufferSize = 1024
+	} else {
+		opts.SQLStoreOpts.Driver = testSQLDriver
+		opts.SQLStoreOpts.Source = testSQLSource
+		opts.SQLStoreOpts.NoCaching = true
+		opts.SQLStoreOpts.MaxOpenConns = 5
+	}
 	opts.FTGroupName = "ft"
 	return opts
+}
+
+func cleanupFTDatastore(t tLogger) {
+	cleanupDatastore(t)
 }
 
 func delayFirstLockAttempt() {
@@ -76,8 +102,8 @@ func cancelFirstLockAttemptDelay() {
 }
 
 func TestFTConfig(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	opts := GetDefaultOptions()
 	opts.FTGroupName = "ft"
@@ -122,8 +148,8 @@ func getFTActiveServer(t *testing.T, servers ...*StanServer) *StanServer {
 }
 
 func TestFTBasic(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	// For this test, use a central NATS server
 	ns := natsdTest.RunDefaultServer()
@@ -134,7 +160,7 @@ func TestFTBasic(t *testing.T) {
 
 	// Configure first server
 	s1sOpts := getTestFTDefaultOptions()
-	s1sOpts.NATSServerURL = "nats://localhost:4222"
+	s1sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s1, err := RunServerWithOpts(s1sOpts, nil)
 	if err != nil {
 		t.Fatalf("Error starting server: %v", err)
@@ -144,7 +170,7 @@ func TestFTBasic(t *testing.T) {
 
 	// Configure second server
 	s2sOpts := getTestFTDefaultOptions()
-	s2sOpts.NATSServerURL = "nats://localhost:4222"
+	s2sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s2, err := RunServerWithOpts(s2sOpts, nil)
 	if err != nil {
 		t.Fatalf("Error starting server: %v", err)
@@ -216,8 +242,8 @@ func waitForGetLockAttempt() {
 }
 
 func TestFTCanStopFTStandby(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	delayFirstLockAttempt()
 	defer cancelFirstLockAttemptDelay()
@@ -273,12 +299,12 @@ func TestFTPartition(t *testing.T) {
 	var natsURL string
 	if parentProcess {
 		ds = defaultDataStore
-		cleanupDatastore(t)
-		defer cleanupDatastore(t)
+		cleanupFTDatastore(t)
+		defer cleanupFTDatastore(t)
 
-		nOpts.Cluster.ListenStr = "nats://localhost:6222"
-		nOpts.RoutesStr = "nats://localhost:6223"
-		natsURL = "nats://localhost:4222"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6222"
+		nOpts.RoutesStr = "nats://127.0.0.1:6223"
+		natsURL = "nats://127.0.0.1:4222"
 
 		// Use a separate NATS server for communication between
 		// processes for the test
@@ -288,13 +314,13 @@ func TestFTPartition(t *testing.T) {
 		defer ipcNATS.Shutdown()
 	} else {
 		nOpts.Port = 4223
-		nOpts.Cluster.ListenStr = "nats://localhost:6223"
-		nOpts.RoutesStr = "nats://localhost:6222"
-		natsURL = "nats://localhost:4223"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6223"
+		nOpts.RoutesStr = "nats://127.0.0.1:6222"
+		natsURL = "nats://127.0.0.1:4223"
 	}
 	// Create NATS client just for synchronization between the
 	// two processes.
-	syncNC, err := nats.Connect("nats://localhost:5222")
+	syncNC, err := nats.Connect("nats://127.0.0.1:5222")
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
@@ -317,7 +343,9 @@ func TestFTPartition(t *testing.T) {
 
 	sOpts := getTestFTDefaultOptions()
 	sOpts.NATSServerURL = natsURL
-	sOpts.FilestoreDir = ds
+	if persistentStoreType == stores.TypeFile {
+		sOpts.FilestoreDir = ds
+	}
 	s := runServerWithOpts(t, sOpts, nil)
 	defer s.Shutdown()
 
@@ -330,9 +358,23 @@ func TestFTPartition(t *testing.T) {
 		errCh := make(chan error, 1)
 		go func() {
 			defer wg.Done()
+			params := []string{
+				"-ft_partition", ds,
+				"-test.v",
+				"-test.run=TestFTPartition$",
+				"-persistent_store", persistentStoreType,
+			}
 			// Start a process that will be the standby
-			out, err := exec.Command(os.Args[0], "-ft_partition", ds,
-				"-test.v", "-test.run=TestFTPartition$").CombinedOutput()
+			if persistentStoreType == stores.TypeSQL {
+				params = append(params,
+					"-sql_create_db=false",
+					"-sql_delete_db=false",
+					"-sql_driver", testSQLDriver,
+					"-sql_source", testSQLSource,
+					"-sql_source_admin", testSQLSourceAdmin,
+					"-sql_db_name", testSQLDatabaseName)
+			}
+			out, err := exec.Command(os.Args[0], params...).CombinedOutput()
 			if err != nil {
 				errCh <- fmt.Errorf("Standby error: %v - %v", err, string(out))
 			}
@@ -387,12 +429,12 @@ func TestFTPartitionReversed(t *testing.T) {
 	var natsURL string
 	if parentProcess {
 		ds = defaultDataStore
-		cleanupDatastore(t)
-		defer cleanupDatastore(t)
+		cleanupFTDatastore(t)
+		defer cleanupFTDatastore(t)
 
-		nOpts.Cluster.ListenStr = "nats://localhost:6222"
-		nOpts.RoutesStr = "nats://localhost:6223"
-		natsURL = "nats://localhost:4222"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6222"
+		nOpts.RoutesStr = "nats://127.0.0.1:6223"
+		natsURL = "nats://127.0.0.1:4222"
 
 		// Use a separate NATS server for communication between
 		// processes for the test
@@ -402,13 +444,13 @@ func TestFTPartitionReversed(t *testing.T) {
 		defer ipcNATS.Shutdown()
 	} else {
 		nOpts.Port = 4223
-		nOpts.Cluster.ListenStr = "nats://localhost:6223"
-		nOpts.RoutesStr = "nats://localhost:6222"
-		natsURL = "nats://localhost:4223"
+		nOpts.Cluster.ListenStr = "nats://127.0.0.1:6223"
+		nOpts.RoutesStr = "nats://127.0.0.1:6222"
+		natsURL = "nats://127.0.0.1:4223"
 	}
 	// Create NATS client just for synchronization between the
 	// two processes.
-	syncNC, err := nats.Connect("nats://localhost:5222")
+	syncNC, err := nats.Connect("nats://127.0.0.1:5222")
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
@@ -435,9 +477,23 @@ func TestFTPartitionReversed(t *testing.T) {
 		errCh := make(chan error, 1)
 		go func() {
 			defer wg.Done()
+			params := []string{
+				"-ft_partition", ds,
+				"-test.v",
+				"-test.run=TestFTPartitionReversed$",
+				"-persistent_store", persistentStoreType,
+			}
 			// Start a process that will act as the active server
-			out, err := exec.Command(os.Args[0], "-ft_partition", ds,
-				"-test.v", "-test.run=TestFTPartitionReversed$").CombinedOutput()
+			if persistentStoreType == stores.TypeSQL {
+				params = append(params,
+					"-sql_create_db=false",
+					"-sql_delete_db=false",
+					"-sql_driver", testSQLDriver,
+					"-sql_source", testSQLSource,
+					"-sql_source_admin", testSQLSourceAdmin,
+					"-sql_db_name", testSQLDatabaseName)
+			}
+			out, err := exec.Command(os.Args[0], params...).CombinedOutput()
 			if err != nil {
 				errCh <- fmt.Errorf("Active error: %v - %v", err, string(out))
 			}
@@ -451,7 +507,9 @@ func TestFTPartitionReversed(t *testing.T) {
 		// Now start our streaming server, it should be a standby
 		sOpts := getTestFTDefaultOptions()
 		sOpts.NATSServerURL = natsURL
-		sOpts.FilestoreDir = ds
+		if persistentStoreType == stores.TypeFile {
+			sOpts.FilestoreDir = ds
+		}
 		s := runServerWithOpts(t, sOpts, nil)
 		defer s.Shutdown()
 		checkState(t, s, FTStandby)
@@ -488,7 +546,9 @@ func TestFTPartitionReversed(t *testing.T) {
 	} else {
 		sOpts := getTestFTDefaultOptions()
 		sOpts.NATSServerURL = natsURL
-		sOpts.FilestoreDir = ds
+		if persistentStoreType == stores.TypeFile {
+			sOpts.FilestoreDir = ds
+		}
 		s := runServerWithOpts(t, sOpts, nil)
 		defer s.Shutdown()
 
@@ -530,8 +590,8 @@ func TestFTPartitionReversed(t *testing.T) {
 }
 
 func TestFTFailedStartup(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	opts := getTestFTDefaultOptions()
 	s := runServerWithOpts(t, opts, nil)
@@ -553,8 +613,8 @@ func TestFTFailedStartup(t *testing.T) {
 }
 
 func TestFTImmediateShutdownOnStartup(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	opts := getTestFTDefaultOptions()
 	s := runServerWithOpts(t, opts, nil)
@@ -563,27 +623,35 @@ func TestFTImmediateShutdownOnStartup(t *testing.T) {
 }
 
 func TestFTGetStoreLockReturnsError(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	delayFirstLockAttempt()
 	defer cancelFirstLockAttemptDelay()
 
+	dl := &dummyLogger{}
+
 	opts := getTestFTDefaultOptions()
+	opts.CustomLogger = dl
 	s := runServerWithOpts(t, opts, nil)
 	defer s.Shutdown()
 	replaceWithMockedStore(s, false, fmt.Errorf("on purpose"))
 	ftReleasePause()
-	checkState(t, s, Failed)
+	// Wait for the firs lock attempt
+	waitForGetLockAttempt()
+	checkState(t, s, FTStandby)
 	// We should get an error about not being able to get the store lock
-	if err := s.LastError(); err == nil || !strings.Contains(err.Error(), "store lock") {
-		t.Fatalf("Unexpected error: %v", err)
+	dl.Lock()
+	msg := dl.msg
+	dl.Unlock()
+	if msg == "" || !strings.Contains(msg, "store lock") {
+		t.Fatalf("Unexpected error: %v", msg)
 	}
 }
 
 func TestFTStayStandbyIfStoreAlreadyLocked(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	delayFirstLockAttempt()
 	defer cancelFirstLockAttemptDelay()
@@ -600,8 +668,8 @@ func TestFTStayStandbyIfStoreAlreadyLocked(t *testing.T) {
 }
 
 func TestFTSteppingDown(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	delayFirstLockAttempt()
 	defer cancelFirstLockAttemptDelay()
@@ -617,7 +685,7 @@ func TestFTSteppingDown(t *testing.T) {
 
 	// Start first server
 	opts1 := getTestFTDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 	ftReleasePause()
@@ -626,7 +694,7 @@ func TestFTSteppingDown(t *testing.T) {
 
 	// Start 2nd server, give it a mock store that says it can get the lock
 	opts2 := getTestFTDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	s2 := runServerWithOpts(t, opts2, nil)
 	defer s2.Shutdown()
 	replaceWithMockedStore(s2, true, nil)
@@ -649,8 +717,8 @@ func TestFTSteppingDown(t *testing.T) {
 }
 
 func TestFTActiveSendsHB(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	// For this test, make the HB interval very small so that we have more
 	// chance to get actual failure when we disconnect from NATS.
@@ -662,7 +730,7 @@ func TestFTActiveSendsHB(t *testing.T) {
 
 	// Start Streaming server
 	opts := getTestFTDefaultOptions()
-	opts.NATSServerURL = "nats://localhost:4222"
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, opts, nil)
 	defer s.Shutdown()
 	// Wait for it to be active
@@ -727,15 +795,15 @@ func TestFTActiveSendsHB(t *testing.T) {
 }
 
 func TestFTActiveReceivesInvalidHBMessages(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
 
 	ns := natsdTest.RunDefaultServer()
 	defer ns.Shutdown()
 
 	// Start Streaming server
 	opts := getTestFTDefaultOptions()
-	opts.NATSServerURL = "nats://localhost:4222"
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, opts, nil)
 	defer s.Shutdown()
 	// Wait for it to be active

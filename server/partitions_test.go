@@ -1,20 +1,34 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2017-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
 import (
 	"fmt"
+	"github.com/nats-io/nuid"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
+	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats-streaming-server/util"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func setPartitionsVarsForTest() {
@@ -99,8 +113,8 @@ func TestPartitionsInvalidRequest(t *testing.T) {
 	}
 	verifyNoResponse := func() {
 		select {
-		case <-msgCh:
-			stackFatalf(t, "Should not have receive a response, got: %v")
+		case m := <-msgCh:
+			stackFatalf(t, "Should not have receive a response, got: %v", m)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
@@ -145,7 +159,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	defer ns.Shutdown()
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel("foofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoofoo", &stores.ChannelLimits{})
 	failSrv, err := RunServerWithOpts(opts1, nil)
@@ -165,7 +179,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	defer ns.Shutdown()
 
 	opts1 = GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel("foo", &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
@@ -185,7 +199,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	cb := func(m *nats.Msg) {
 		req := &spb.CtrlMsg{}
 		req.Unmarshal(m.Data)
-		channels, _ := decodeChannels(req.Data)
+		channels, _ := util.DecodeChannels(req.Data)
 		for _, c := range channels {
 			verifyChannels[c] = struct{}{}
 			count++
@@ -202,7 +216,7 @@ func TestPartitionsMaxPayload(t *testing.T) {
 	}
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	for i := 0; i < total-1; i++ {
 		channelName := fmt.Sprintf("channel.number.%d", (i + 1))
@@ -287,14 +301,14 @@ func TestPartitionsWithClusterOfServers(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	s1 := runServerWithOpts(t, opts1, nil)
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	s2 := runServerWithOpts(t, opts2, nil)
@@ -347,7 +361,7 @@ func TestPartitionsWithClusterOfServers(t *testing.T) {
 			stackFatalf(t, "Server should not have channel %v", chanNotOk)
 		}
 		if n, _ := msgStoreState(t, s.channels.get(chanOk).store.Msgs); n != 1 {
-			stackFatalf(t, "Channel %q should have 1 message and no error, got %v - %v", chanOk, n)
+			stackFatalf(t, "Channel %q should have 1 message and no error, got %v", chanOk, n)
 		}
 	}
 	checkChannel(s1, fooSubj, barSubj)
@@ -371,7 +385,7 @@ func TestPartitionsDuplicatedOnTwoServers(t *testing.T) {
 	barSubj := "bar"
 
 	opts1 := GetDefaultOptions()
-	opts1.NATSServerURL = "nats://localhost:4222"
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
 	opts1.Partitioning = true
 	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
 	opts1.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
@@ -379,7 +393,7 @@ func TestPartitionsDuplicatedOnTwoServers(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
 	// Expecting this to fail
@@ -403,7 +417,7 @@ func TestPartitionsConflictDueToWildcards(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts2 := GetDefaultOptions()
-	opts2.NATSServerURL = "nats://localhost:4222"
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
 	opts2.Partitioning = true
 	opts2.StoreLimits.AddPerChannel("foo.bar", &stores.ChannelLimits{})
 	// Expecting this to fail
@@ -447,7 +461,7 @@ func TestPartitionsSendListAfterRouteEstablished(t *testing.T) {
 		return func(m *nats.Msg) {
 			req := &spb.CtrlMsg{}
 			req.Unmarshal(m.Data)
-			channels, _ := decodeChannels(req.Data)
+			channels, _ := util.DecodeChannels(req.Data)
 			for _, c := range channels {
 				mu.Lock()
 				if c == "foo" && *s != nil && req.ServerID == (*s).serverID {
@@ -619,4 +633,430 @@ func TestPartitionsWildcards(t *testing.T) {
 	if _, err := sc.Subscribe("foo.bar.baz", cb); err == nil {
 		t.Fatal("Expected error on subscribe, got none")
 	}
+}
+
+func checkWaitOnRegisterMap(t tLogger, s *StanServer, size int) {
+	var start time.Time
+	for {
+		s.clients.RLock()
+		m := s.clients.waitOnRegister
+		mlen := len(m)
+		s.clients.RUnlock()
+		if m != nil && mlen == size {
+			return
+		}
+		if start.IsZero() {
+			start = time.Now()
+		} else if time.Since(start) > clientCheckTimeout+50*time.Millisecond {
+			stackFatalf(t, "map should have been created and of size %d, got %v", size, mlen)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+func checkKnownInvalidMap(t *testing.T, s *StanServer, size int, id string) {
+	t.Helper()
+	waitFor(t, clientCheckTimeout+50*time.Millisecond, 15*time.Millisecond, func() error {
+		var ki bool
+		s.clients.RLock()
+		if id != "" {
+			_, ki = s.clients.knownInvalid[id+":"]
+		}
+		mlen := len(s.clients.knownInvalid)
+		s.clients.RUnlock()
+		if size != mlen {
+			return fmt.Errorf("expected map size to be %v, got %v", size, mlen)
+		}
+		if size > 0 && !ki {
+			return fmt.Errorf("expected %q to be in the map, it was not", id)
+		}
+		return nil
+	})
+}
+
+func TestPartitionsRaceOnPub(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	clientCheckTimeout = 250 * time.Millisecond
+	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
+
+	opts := GetDefaultOptions()
+	opts.Partitioning = true
+	opts.AddPerChannel("foo", &stores.ChannelLimits{})
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	// stan.Connect() call blocks until it receives the response, so it is
+	// not possible to publish a message before the server has processed the
+	// connection request. However, with partitioning, it is possible that
+	// the Connect() call receives an OK from one of the server and immediately
+	// publishes a message. That message, although behind the connection request
+	// going to another server, may be dispatched before (due to use of different
+	// internal subscriptions for connection handling and client publish).
+	//
+	// To simulate this here, we use a NATS connection and send a PubMsg manually,
+	// followed by the regular stan.Connect(). Then we wait for the response on
+	// the PubMsg and we should not get any error in PubAck.
+
+	// Create a direct NATS connection
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unable to connect: %v", err)
+	}
+	defer nc.Close()
+
+	s.mu.Lock()
+	pubSubj := fmt.Sprintf("%s.foo", s.info.Publish)
+	pubReq := &pb.PubMsg{ClientID: clientName, Subject: "foo", Data: []byte("hello")}
+	pubNuid := nuid.New()
+
+	connSubj := s.info.Discovery
+	connReq := &pb.ConnectRequest{ClientID: clientName, HeartbeatInbox: nats.NewInbox()}
+	connBytes, _ := connReq.Marshal()
+
+	closeSubj := s.info.Close
+	closeReq := &pb.CloseRequest{ClientID: clientName}
+	closeBytes, _ := closeReq.Marshal()
+	s.mu.Unlock()
+
+	// Repeat the test, because even with bug, it would be possible
+	// that the connection request is still processed first, which
+	// would make the test pass.
+	for i := 0; i < 5; i++ {
+		func() {
+			pubReq.Guid = pubNuid.Next()
+			pubBytes, _ := pubReq.Marshal()
+
+			// First case is to make sure that we get the failure if
+			// no connection is processed.
+			resp, err := nc.Request(pubSubj, pubBytes, clientCheckTimeout+50*time.Millisecond)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			pubResp := &pb.PubAck{}
+			pubResp.Unmarshal(resp.Data)
+			if pubResp.Error != ErrInvalidPubReq.Error() {
+				t.Fatalf("Expected error %q, got %q", ErrInvalidPubReq, pubResp.Error)
+			}
+			// Ensure that the notification map has been created, but is empty.
+			checkWaitOnRegisterMap(t, s, 0)
+			checkKnownInvalidMap(t, s, 1, clientName)
+
+			// Now resend a message and it should fail quickly since server
+			// should have recorded this as an invalid client ID.
+			start := time.Now()
+			resp, err = nc.Request(pubSubj, pubBytes, clientCheckTimeout)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			dur := time.Since(start)
+			pubResp = &pb.PubAck{}
+			pubResp.Unmarshal(resp.Data)
+			if pubResp.Error != ErrInvalidPubReq.Error() {
+				t.Fatalf("Expected error %q, got %q", ErrInvalidPubReq, pubResp.Error)
+			}
+			// It is expected to have taken less than the clientCheckTimeout this time
+			if dur > clientCheckTimeout {
+				t.Fatalf("Second failure should not have take longer than %v, took %v", clientCheckTimeout, dur)
+			}
+			checkKnownInvalidMap(t, s, 1, clientName)
+
+			// Now connect (using bare connect so that we don't use connID)
+			resp, err = nc.Request(connSubj, connBytes, time.Second)
+			if err != nil {
+				t.Fatalf("Error on connect: %v", err)
+			}
+			connResp := &pb.ConnectResponse{}
+			connResp.Unmarshal(resp.Data)
+			if connResp.Error != "" {
+				t.Fatalf("Connect error: %s", connResp.Error)
+			}
+			// This should clear the knownInvalid map
+			checkKnownInvalidMap(t, s, 0, "")
+
+			// Verify that we can send ok now..
+			resp, err = nc.Request(pubSubj, pubBytes, clientCheckTimeout)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			pubResp = &pb.PubAck{}
+			pubResp.Unmarshal(resp.Data)
+			if pubResp.Error != "" {
+				t.Fatalf("Connection %d - Error on publish: %v", (i + 1), pubResp.Error)
+			}
+			checkWaitOnRegisterMap(t, s, 0)
+
+			resp, err = nc.Request(closeSubj, closeBytes, time.Second)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			connCloseResp := &pb.ConnectResponse{}
+			connCloseResp.Unmarshal(resp.Data)
+			if connCloseResp.Error != "" {
+				t.Fatalf("Error on close: %s", connCloseResp.Error)
+			}
+		}()
+	}
+}
+
+func TestPartitionsRaceOnSub(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	clientCheckTimeout = 250 * time.Millisecond
+	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
+
+	opts := GetDefaultOptions()
+	opts.Partitioning = true
+	opts.AddPerChannel("foo", &stores.ChannelLimits{})
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	// See description of the issue in TestPartitionsRaceOnPub.
+	// This is the same except that we are dealing with subscription requests
+	// here.
+
+	// Create a direct NATS connection
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unable to connect: %v", err)
+	}
+	defer nc.Close()
+
+	s.mu.Lock()
+	subSubj := s.info.Subscribe
+	subReq := &pb.SubscriptionRequest{ClientID: clientName, Subject: "foo", AckWaitInSecs: 30, MaxInFlight: 1}
+
+	connSubj := s.info.Discovery
+	connReq := &pb.ConnectRequest{ClientID: clientName, HeartbeatInbox: nats.NewInbox()}
+	connBytes, _ := connReq.Marshal()
+
+	closeSubj := s.info.Close
+	closeReq := &pb.CloseRequest{ClientID: clientName}
+	closeBytes, _ := closeReq.Marshal()
+	s.mu.Unlock()
+
+	// Repeat the test, because even with bug, it would be possible
+	// that the connection request is still processed first, which
+	// would make the test pass.
+	for i := 0; i < 5; i++ {
+		func() {
+			subReq.Inbox = nats.NewInbox()
+			subBytes, _ := subReq.Marshal()
+
+			// First case is to make sure that we get the failure if
+			// no connection is processed.
+			resp, err := nc.Request(subSubj, subBytes, clientCheckTimeout+50*time.Millisecond)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			subResp := &pb.SubscriptionResponse{}
+			subResp.Unmarshal(resp.Data)
+			if subResp.Error != ErrInvalidSubReq.Error() {
+				t.Fatalf("Expected error %q, got %q", ErrInvalidSubReq, subResp.Error)
+			}
+			// Ensure that the notification map has been created, but is empty.
+			checkWaitOnRegisterMap(t, s, 0)
+			checkKnownInvalidMap(t, s, 1, clientName)
+
+			// Now resend the subscription and it should fail quickly since server
+			// should have recorded this as an invalid client ID.
+			start := time.Now()
+			resp, err = nc.Request(subSubj, subBytes, clientCheckTimeout)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			dur := time.Since(start)
+			subResp = &pb.SubscriptionResponse{}
+			subResp.Unmarshal(resp.Data)
+			if subResp.Error != ErrInvalidSubReq.Error() {
+				t.Fatalf("Expected error %q, got %q", ErrInvalidSubReq, subResp.Error)
+			}
+			// It is expected to have taken less than the clientCheckTimeout this time
+			if dur > clientCheckTimeout {
+				t.Fatalf("Second failure should not have take longer than %v, took %v", clientCheckTimeout, dur)
+			}
+			checkKnownInvalidMap(t, s, 1, clientName)
+
+			// Now connect (using bare connect so that we don't use connID)
+			resp, err = nc.Request(connSubj, connBytes, time.Second)
+			if err != nil {
+				t.Fatalf("Error on connect: %v", err)
+			}
+			connResp := &pb.ConnectResponse{}
+			connResp.Unmarshal(resp.Data)
+			if connResp.Error != "" {
+				t.Fatalf("Connect error: %s", connResp.Error)
+			}
+			// SHould be removed from map
+			checkKnownInvalidMap(t, s, 0, "")
+
+			// Now we should get the OK for the subscription.
+			resp, err = nc.Request(subSubj, subBytes, clientCheckTimeout)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			subResp = &pb.SubscriptionResponse{}
+			subResp.Unmarshal(resp.Data)
+			if subResp.Error != "" {
+				t.Fatalf("Connection %d - Error on subscribe: %v", (i + 1), subResp.Error)
+			}
+			checkWaitOnRegisterMap(t, s, 0)
+
+			resp, err = nc.Request(closeSubj, closeBytes, time.Second)
+			if err != nil {
+				t.Fatalf("Error on request: %v", err)
+			}
+			connCloseResp := &pb.ConnectResponse{}
+			connCloseResp.Unmarshal(resp.Data)
+			if connCloseResp.Error != "" {
+				t.Fatalf("Error on close: %s", connCloseResp.Error)
+			}
+		}()
+	}
+}
+
+func TestPartitionsAndFT(t *testing.T) {
+	cleanupFTDatastore(t)
+	defer cleanupFTDatastore(t)
+
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	// For this test, both server will connect to same NATS Server
+	ncOpts := natsdTest.DefaultTestOptions
+	ns := natsdTest.RunServer(&ncOpts)
+	defer ns.Shutdown()
+
+	opts := getTestFTDefaultOptions()
+	opts.Partitioning = true
+	opts.AddPerChannel("foo", &stores.ChannelLimits{})
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
+
+	ft1 := runServerWithOpts(t, opts, nil)
+	defer ft1.Shutdown()
+
+	// The standby should be able to start
+	ft2 := runServerWithOpts(t, opts, nil)
+	defer ft2.Shutdown()
+
+	ft1.Shutdown()
+
+	// Wait for ft2 to activate
+	checkState(t, ft2, FTActive)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+}
+
+func TestPartitionsClientPings(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	clientCheckTimeout = 150 * time.Millisecond
+	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
+
+	// For this test, create a single NATS server to which both servers connect to.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	fooSubj := "foo"
+	barSubj := "bar"
+
+	opts1 := GetDefaultOptions()
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
+	opts1.Partitioning = true
+	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
+	s1 := runServerWithOpts(t, opts1, nil)
+	defer s1.Shutdown()
+
+	opts2 := GetDefaultOptions()
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
+	opts2.Partitioning = true
+	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
+	s2 := runServerWithOpts(t, opts2, nil)
+	defer s2.Shutdown()
+
+	testClientPings(t, s1)
+}
+
+func TestPartitionsCleanInvalidConns(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	clientCheckTimeout = 1 * time.Millisecond
+	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
+
+	opts := GetDefaultOptions()
+	opts.Partitioning = true
+	opts.AddPerChannel("foo", &stores.ChannelLimits{})
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	// Create a direct NATS connection
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unable to connect: %v", err)
+	}
+	defer nc.Close()
+
+	total := 300
+
+	pubSubj := fmt.Sprintf("%s.foo", s.info.Publish)
+	for i := 0; i < total; i++ {
+		pubReq := &pb.PubMsg{
+			ClientID: fmt.Sprintf("%s%d", clientName, i),
+			Subject:  "foo",
+			Data:     []byte("hello"),
+			Guid:     fmt.Sprintf("guid%d", i),
+		}
+		b, _ := pubReq.Marshal()
+		nc.Request(pubSubj, b, time.Second)
+	}
+	// The map should not have grown to 300
+	s.clients.RLock()
+	mlen := len(s.clients.knownInvalid)
+	s.clients.RUnlock()
+
+	if mlen > maxKnownInvalidConns {
+		t.Fatalf("Should not be more than %v, got %v", maxKnownInvalidConns, mlen)
+	}
+}
+
+func TestPartitionsDurableReplaced(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	clientCheckTimeout = 150 * time.Millisecond
+	defer func() { clientCheckTimeout = defaultClientCheckTimeout }()
+
+	// For this test, create a single NATS server to which both servers connect to.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	fooSubj := "foo"
+	barSubj := "bar"
+
+	opts1 := GetDefaultOptions()
+	opts1.NATSServerURL = "nats://127.0.0.1:4222"
+	opts1.Partitioning = true
+	opts1.ReplaceDurable = true
+	opts1.StoreLimits.AddPerChannel(fooSubj, &stores.ChannelLimits{})
+	s1 := runServerWithOpts(t, opts1, nil)
+	defer s1.Shutdown()
+
+	opts2 := GetDefaultOptions()
+	opts2.NATSServerURL = "nats://127.0.0.1:4222"
+	opts2.Partitioning = true
+	opts2.ReplaceDurable = true
+	opts2.StoreLimits.AddPerChannel(barSubj, &stores.ChannelLimits{})
+	s2 := runServerWithOpts(t, opts2, nil)
+	defer s2.Shutdown()
+
+	testDurableReplaced(t, s1)
 }

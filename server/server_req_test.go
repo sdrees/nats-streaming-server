@@ -1,4 +1,16 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2021 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package server
 
 import (
@@ -7,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 type response interface {
@@ -119,7 +131,7 @@ func TestInvalidSubRequest(t *testing.T) {
 	defer nc.Close()
 
 	// This test is very dependent on the validity tests performed
-	// in StanServer.processSubscriptionRequest(). Any cahnge there
+	// in StanServer.processSubscriptionRequest(). Any change there
 	// may require changes here.
 
 	// Create empty request
@@ -189,20 +201,22 @@ func TestInvalidSubRequest(t *testing.T) {
 	}
 
 	// Test Queue Group DurableName
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
 	req.Subject = "foo"
 	req.QGroup = "queue"
 	req.DurableName = "dur:name"
 	if err := sendInvalidSubRequest(s, nc, req, ErrInvalidDurName); err != nil {
 		t.Fatalf("%v", err)
 	}
+	sc.Close()
 
 	// Reset those
 	req.QGroup = ""
 	req.DurableName = ""
 
-	// Now we should have an error that says that we can't find client ID
-	// (that is, client was not registered).
-	if err := sendInvalidSubRequest(s, nc, req, fmt.Errorf("can't find clientID: %v", clientName)); err != nil {
+	// Now we should have an error that says that we have an unknown client ID.
+	if err := sendInvalidSubRequest(s, nc, req, ErrUnknownClient); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -215,7 +229,7 @@ func TestInvalidSubRequest(t *testing.T) {
 	}
 
 	// Create a durable
-	sc := NewDefaultConnection(t)
+	sc = NewDefaultConnection(t)
 	defer sc.Close()
 	dur, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 	if err != nil {
@@ -233,7 +247,7 @@ func TestInvalidSubRequest(t *testing.T) {
 	req.ClientID = clientName
 	req.Subject = "foo"
 	req.DurableName = "dur"
-	if err := sendInvalidSubRequest(s, nc, req, fmt.Errorf("can't find clientID: %v", clientName)); err != nil {
+	if err := sendInvalidSubRequest(s, nc, req, ErrUnknownClient); err != nil {
 		t.Fatalf("%v", err)
 	}
 }

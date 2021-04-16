@@ -1,14 +1,30 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package server
 
 import (
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func TestTooManyChannelsOnCreateSub(t *testing.T) {
@@ -72,19 +88,39 @@ func TestTooManySubs(t *testing.T) {
 	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
+	check := func() {
+		cs := channelsGet(t, s.channels, "foo")
+		ss := cs.ss
+		ss.RLock()
+		if ss.psubs == nil || len(ss.psubs) != 1 {
+			stackFatalf(t, "Expected only one subscription, got %v", len(ss.psubs))
+		}
+		ss.RUnlock()
+		subs := s.clients.getSubs(clientName)
+		if len(subs) != 1 {
+			stackFatalf(t, "Expected 1 subscription for client %q, got %+v", clientName, subs)
+		}
+	}
 	// We should get an error here
 	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err == nil {
 		t.Fatal("Expected error on subscribe, go none")
 	}
-	cs := channelsGet(t, s.channels, "foo")
-	ss := cs.ss
-	func() {
-		ss.RLock()
-		defer ss.RUnlock()
-		if ss.psubs == nil || len(ss.psubs) != 1 {
-			t.Fatalf("Expected only one subscription, got %v", len(ss.psubs))
-		}
-	}()
+	check()
+	// Try with a durable
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatal("Expected error on subscribe, go none")
+	}
+	check()
+	// And a queue sub
+	if _, err := sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}); err == nil {
+		t.Fatal("Expected error on subscribe, go none")
+	}
+	check()
+	// Finally a durable queue sub
+	if _, err := sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatal("Expected error on subscribe, go none")
+	}
+	check()
 }
 
 func TestMaxMsgs(t *testing.T) {
@@ -109,6 +145,9 @@ func TestMaxMsgs(t *testing.T) {
 }
 
 func TestMaxBytes(t *testing.T) {
+	if testUseEncryption {
+		t.SkipNow()
+	}
 	payload := []byte("hello")
 	m := pb.MsgProto{Data: payload, Subject: "foo", Sequence: 1, Timestamp: time.Now().UnixNano()}
 	msgSize := m.Size()
@@ -260,10 +299,6 @@ func TestPerChannelLimits(t *testing.T) {
 			defer cleanupDatastore(t)
 
 			opts = getTestDefaultOptsForPersistentStore()
-			if opts.StoreType == stores.TypeFile {
-				stores.FileStoreTestSetBackgroundTaskInterval(15 * time.Millisecond)
-				defer stores.FileStoreTestResetBackgroundTaskInterval()
-			}
 		}
 		opts.MaxMsgs = 10
 		opts.MaxAge = time.Hour
@@ -421,12 +456,352 @@ func TestUnlimitedPerChannelLimits(t *testing.T) {
 		t.Fatal("Expected to fail to subscribe, did not")
 	}
 	// Wait more than MaxAge
-	time.Sleep(15 * time.Millisecond)
-	// Messages should have all disappear
-	s.mu.RLock()
-	n, _, _ = s.channels.msgsState("bar")
-	s.mu.RUnlock()
-	if n != 0 {
-		t.Fatalf("Expected 0 messages, store reports %v", n)
+	waitForCount(t, 0, func() (string, int) {
+		// Messages should have all disappear
+		s.mu.RLock()
+		n, _, _ = s.channels.msgsState("bar")
+		s.mu.RUnlock()
+		return "messages for bar", n
+	})
+}
+
+func TestPerChannelLimitsSetToUnlimitedPrintedCorrectly(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.MaxSubscriptions = 10
+	opts.MaxMsgs = 10
+	opts.MaxBytes = 64 * 1024
+	opts.MaxAge = time.Hour
+
+	clfoo := stores.ChannelLimits{}
+	clfoo.MaxSubscriptions = -1
+	clfoo.MaxMsgs = -1
+	clfoo.MaxBytes = -1
+	clfoo.MaxAge = -1
+
+	sl := &opts.StoreLimits
+	sl.AddPerChannel("foo", &clfoo)
+
+	l := &captureNoticesLogger{}
+	opts.EnableLogging = true
+	opts.CustomLogger = l
+
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	var notices []string
+	l.Lock()
+	for _, line := range l.notices {
+		if strings.Contains(line, "-1") {
+			notices = l.notices
+			break
+		}
 	}
+	l.Unlock()
+	if notices != nil {
+		t.Fatalf("There should not be -1 values, got %v", notices)
+	}
+}
+
+func checkChannelActivity(t tLogger, s *StanServer, name string, expectedToExist bool, created time.Time, maxInactivity time.Duration) {
+	if expectedToExist {
+		// Check that we are not invoked too late
+		if time.Since(created) >= maxInactivity {
+			// assume ok, return
+			return
+		}
+		if s.channels.get(name) == nil {
+			stackFatalf(t, "Channel %q was expected to exist", name)
+		}
+		return
+	}
+	// Here, we wait for the channel to be removed.
+	// We will wait up to the channel max inactivity before reporting failure
+	timeout := time.Now().Add(maxInactivity + 60*time.Millisecond)
+	for time.Now().Before(timeout) {
+		// If channel is no longer there, we are good.
+		if s.channels.get(name) == nil {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	stackFatalf(t, "Channel %q was not expected to exist", name)
+}
+
+func TestMaxInactivity(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	opts := getTestDefaultOptsForPersistentStore()
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
+	opts.MaxInactivity = 100 * time.Millisecond
+	fooStarLimits := &stores.ChannelLimits{MaxInactivity: 500 * time.Millisecond}
+	opts.AddPerChannel("foo.*", fooStarLimits)
+	opts.AddPerChannel("foo.bar", &stores.ChannelLimits{MaxInactivity: -1})
+	recoveredLimits := &stores.ChannelLimits{MaxInactivity: 800 * time.Millisecond}
+	opts.AddPerChannel("recovered", recoveredLimits)
+	pubLimits := &stores.ChannelLimits{MaxInactivity: 1000 * time.Millisecond}
+	opts.AddPerChannel("pub", pubLimits)
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	wg := sync.WaitGroup{}
+	errCh := make(chan error, 1)
+	// If a subscription exists, channel should not be removed.
+	checkChannelNotDeletedDueToSub := func(channel, queue, dur string) {
+		defer wg.Done()
+		var (
+			sub stan.Subscription
+			err error
+		)
+		if dur != "" {
+			sub, err = sc.QueueSubscribe(channel, queue, func(_ *stan.Msg) {}, stan.DurableName(dur))
+		} else {
+			sub, err = sc.QueueSubscribe(channel, queue, func(_ *stan.Msg) {})
+		}
+		if err != nil {
+			select {
+			case errCh <- fmt.Errorf("Error on subscribe: %v", err):
+				return
+			default:
+			}
+		}
+		defer sub.Unsubscribe()
+		time.Sleep(opts.MaxInactivity + 50*time.Millisecond)
+		verifyChannelExist(t, s, channel, true, time.Second)
+	}
+	wg.Add(4)
+	go checkChannelNotDeletedDueToSub("c1", "", "")
+	go checkChannelNotDeletedDueToSub("c2", "queue", "")
+	go checkChannelNotDeletedDueToSub("c3", "", "dur")
+	go checkChannelNotDeletedDueToSub("c4", "queue", "dur")
+	wg.Wait()
+	select {
+	case e := <-errCh:
+		t.Fatal(e.Error())
+	default:
+	}
+	// Since last subscription is closed, wait more than
+	// MaxInactivity, all those channels should have been deleted
+	time.Sleep(opts.MaxInactivity + 50*time.Millisecond)
+	verifyChannelExist(t, s, "c1", false, time.Second)
+	verifyChannelExist(t, s, "c2", false, time.Second)
+	verifyChannelExist(t, s, "c3", false, time.Second)
+	verifyChannelExist(t, s, "c4", false, time.Second)
+
+	// Keep sending to keep a channel alive.
+	ch := make(chan struct{}, 1)
+	wg = sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-time.After(50 * time.Millisecond):
+				sc.Publish("c5", []byte("hello"))
+			case <-ch:
+				return
+			}
+		}
+	}()
+	// Check that channel is not removed
+	time.Sleep(2 * opts.MaxInactivity)
+	verifyChannelExist(t, s, "c5", true, time.Second)
+	ch <- struct{}{}
+	wg.Wait()
+	// wait more... and it should be deleted
+	verifyChannelExist(t, s, "c5", false, 2*opts.MaxInactivity)
+
+	// Verify that offline durables do not prevent removal.
+	dur, err := sc.Subscribe("c6", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Close durable
+	dur.Close()
+	time.Sleep(2 * opts.MaxInactivity)
+	verifyChannelExist(t, s, "c6", false, time.Second)
+
+	qdur, err := sc.QueueSubscribe("c7", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Close durable
+	qdur.Close()
+	time.Sleep(2 * opts.MaxInactivity)
+	verifyChannelExist(t, s, "c7", false, time.Second)
+
+	// Check that last activity bumps the next check
+	if err := sc.Publish("pub", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	c := channelsGet(t, s.channels, "pub")
+	created := c.activity.last
+	// Wait half MaxInactivity
+	time.Sleep(pubLimits.MaxInactivity / 2)
+	// Publish another
+	if err := sc.Publish("pub", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Sleep the other half (and a bit more)
+	time.Sleep((pubLimits.MaxInactivity / 2) + 50*time.Millisecond)
+	// Channel should still exist
+	checkChannelActivity(t, s, "pub", true, created, pubLimits.MaxInactivity)
+	// Wait for at least MaxInactivity since last publish and now channel
+	// should be gone.
+	checkChannelActivity(t, s, "pub", false, created, pubLimits.MaxInactivity)
+
+	// Create store foo.baz, it should be deleted after 500ms
+	if err := sc.Publish("foo.baz", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	c = s.channels.get("foo.baz")
+	if c != nil {
+		created = c.activity.last
+		time.Sleep(fooStarLimits.MaxInactivity / 2)
+		checkChannelActivity(t, s, "foo.baz", true, created, fooStarLimits.MaxInactivity)
+		// Wait more than 500ms (total), channel should be gone
+		checkChannelActivity(t, s, "foo.baz", false, created, fooStarLimits.MaxInactivity)
+	}
+
+	// Channel foo.bar should override the MaxInactivity to
+	// unlimited, so channel is not expected to be deleted.
+	if err := sc.Publish("foo.bar", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Wait for more than 500ms
+	time.Sleep(fooStarLimits.MaxInactivity + 100*time.Millisecond)
+	verifyChannelExist(t, s, "foo.bar", true, 2*time.Second)
+
+	// Check that if a channel with higher MaxInactivity is added
+	// first, then one with lower MaxInactivity is added next,
+	// then it will be deleted at appropriate time
+	if err := sc.Publish("foo.baz", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	c = s.channels.get("foo.baz")
+	if c != nil {
+		c = channelsGet(t, s.channels, "foo.baz")
+		created = c.activity.last
+		if err := sc.Publish("c9", []byte("hello")); err != nil {
+			t.Fatalf("Error on publish: %v", err)
+		}
+		time.Sleep(2 * opts.MaxInactivity)
+		verifyChannelExist(t, s, "c9", false, time.Second)
+		checkChannelActivity(t, s, "foo.baz", true, created, fooStarLimits.MaxInactivity)
+		checkChannelActivity(t, s, "foo.baz", false, created, fooStarLimits.MaxInactivity)
+	}
+
+	// Send a message on a new channel and restart server
+	if err := sc.Publish("recovered", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Before shutdown, verify foo.bar still exists
+	verifyChannelExist(t, s, "foo.bar", true, 2*time.Second)
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+	c = s.channels.get("recovered")
+	if c != nil {
+		created = c.activity.last
+		// Check channels exist
+		checkChannelActivity(t, s, "recovered", true, created, recoveredLimits.MaxInactivity)
+		verifyChannelExist(t, s, "foo.bar", true, 2*time.Second)
+		// But without any activity, it should go away
+		checkChannelActivity(t, s, "recovered", false, created, recoveredLimits.MaxInactivity)
+		// This one should always be there
+		verifyChannelExist(t, s, "foo.bar", true, 2*time.Second)
+	}
+
+	// Send to a new channel
+	if err := sc.Publish("c10", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Block the ioLoop
+	ch1, ch2 := s.sendSynchronziationRequest()
+	select {
+	case <-ch1:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Did not get notification from ioLoop")
+	}
+	// Wait for timer to fire and post delete channel request to ioLoop
+	// which will be delayed since we did not release the ioLoop yet.
+	time.Sleep(2 * opts.MaxInactivity)
+	// Create a subscription
+	sub, err := sc.Subscribe("c10", func(_ *stan.Msg) {})
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Release ioLoop
+	close(ch2)
+	// Check that channel was not deleted
+	verifyChannelExist(t, s, "c10", true, 2*opts.MaxInactivity)
+	c = s.channels.get("c10")
+	s.channels.RLock()
+	tset := c.activity.timerSet
+	s.channels.RUnlock()
+	if tset {
+		t.Fatalf("Timer should not be set")
+	}
+	sub.Unsubscribe()
+	// Now should be removed
+	verifyChannelExist(t, s, "c10", false, 2*opts.MaxInactivity)
+
+	sc.Close()
+}
+
+func TestMaxInactivityOnConnectionClose(t *testing.T) {
+	o := GetDefaultOptions()
+	o.MaxInactivity = 250 * time.Millisecond
+	o.ClientHBInterval = 100 * time.Millisecond
+	o.ClientHBTimeout = 50 * time.Millisecond
+	o.ClientHBFailCount = 2
+	s := runServerWithOpts(t, o, nil)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if s.channels.get("foo") == nil {
+		t.Fatalf("Channel should exit")
+	}
+	// Close connection without closing subscription
+	sc.Close()
+	// Wait for server to remove...
+	waitForNumClients(t, s, 0)
+	// Wait for channel to be removed
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if s.channels.get("foo") != nil {
+			return fmt.Errorf("Channel should have been removed")
+		}
+		return nil
+	})
+	sc.Close()
+
+	sc = NewDefaultConnection(t)
+	defer sc.Close()
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if s.channels.get("foo") == nil {
+		t.Fatalf("Channel should exit")
+	}
+	// Close NATS connection to cause server to remove it
+	sc.NatsConn().Close()
+	// Wait for server to remove...
+	waitForNumClients(t, s, 0)
+	// Wait for channel to be removed
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if s.channels.get("foo") != nil {
+			return fmt.Errorf("Channel should have been removed")
+		}
+		return nil
+	})
 }

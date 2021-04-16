@@ -1,8 +1,20 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package util
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"runtime"
@@ -10,6 +22,13 @@ import (
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	// This one is added here so that if we want to disable sql for stores tests
+	// we can use the same param for all packages as in "go test -v ./... -sql=false"
+	flag.Bool("sql", false, "Not used for util tests")
+	os.Exit(m.Run())
+}
 
 func stackFatalf(t *testing.T, f string, args ...interface{}) {
 	lines := make([]string, 0, 32)
@@ -27,6 +46,8 @@ func stackFatalf(t *testing.T, f string, args ...interface{}) {
 	}
 
 	t.Fatalf("%s", strings.Join(lines, "\n"))
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func TestEnsureBufBigEnough(t *testing.T) {
@@ -158,7 +179,7 @@ func TestBackoffTimeCheck(t *testing.T) {
 	// Repeat calls until frequency is increased to the max
 	freqs := make([]time.Duration, 0)
 	last := time.Now()
-	timeout := time.Now().Add(350 * time.Millisecond)
+	timeout := time.Now().Add(400 * time.Millisecond)
 	for time.Now().Before(timeout) {
 		if print.Ok() {
 			freqs = append(freqs, time.Since(last))

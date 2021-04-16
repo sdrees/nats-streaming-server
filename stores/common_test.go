@@ -1,4 +1,15 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
@@ -9,13 +20,15 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/spb"
+	"github.com/nats-io/nats-streaming-server/test"
 	"github.com/nats-io/nuid"
+	"github.com/nats-io/stan.go/pb"
 )
 
 var testDefaultStoreLimits = StoreLimits{
@@ -28,6 +41,7 @@ var testDefaultStoreLimits = StoreLimits{
 		SubStoreLimits{
 			MaxSubscriptions: 1000,
 		},
+		0,
 	},
 	nil,
 }
@@ -47,13 +61,18 @@ type testStore struct {
 }
 
 var (
-	nuidGen    *nuid.NUID
 	testLogger logger.Logger
-	testStores = []*testStore{&testStore{TypeMemory, false}, &testStore{TypeFile, true}}
+	testStores = []*testStore{
+		{TypeMemory, false},
+		{TypeFile, true},
+		{TypeSQL, true},
+		{TypeRaft, false},
+	}
+	testTimestampMu   sync.Mutex
+	testLastTimestamp int64
 )
 
 func init() {
-	nuidGen = nuid.New()
 	// Create an empty logger (no actual logger is set without calling SetLogger())
 	testLogger = logger.NewStanLogger()
 }
@@ -81,6 +100,8 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 	}
 
 	t.Fatalf("%s", strings.Join(lines, "\n"))
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func msgStoreLookup(t tLogger, ms MsgStore, seq uint64) *pb.MsgProto {
@@ -154,7 +175,11 @@ func subStoreDeleteSub(t tLogger, ss SubStore, subid uint64) {
 }
 
 func storeAddClient(t tLogger, s Store, clientID, hbInbox string) *Client {
-	c, err := s.AddClient(clientID, hbInbox)
+	client := &spb.ClientInfo{
+		ID:      clientID,
+		HbInbox: hbInbox,
+	}
+	c, err := s.AddClient(client)
 	if err != nil {
 		stackFatalf(t, "Error adding client %q: %v", clientID, err)
 	}
@@ -175,21 +200,34 @@ func storeDeleteClient(t tLogger, s Store, clientID string) {
 	}
 }
 
-func storeMsg(t *testing.T, cs *Channel, channel string, data []byte) *pb.MsgProto {
+func storeMsg(t tLogger, cs *Channel, channel string, seq uint64, data []byte) *pb.MsgProto {
+	testTimestampMu.Lock()
+	tm := time.Now().UnixNano()
+	if testLastTimestamp > 0 && tm < testLastTimestamp {
+		tm = testLastTimestamp
+	}
+	testLastTimestamp = tm
+	testTimestampMu.Unlock()
 	ms := cs.Msgs
-	seq, err := ms.Store(data)
+	seq, err := ms.Store(&pb.MsgProto{
+		Sequence:  seq,
+		Data:      data,
+		Subject:   channel,
+		Timestamp: tm,
+	})
 	if err != nil {
 		stackFatalf(t, "Error storing message into channel [%v]: %v", channel, err)
 	}
 	return msgStoreLookup(t, ms, seq)
 }
 
-func storeSub(t *testing.T, cs *Channel, channel string) uint64 {
+func storeSub(t tLogger, cs *Channel, channel string) uint64 {
+	nid := nuid.New()
 	ss := cs.Subs
 	sub := &spb.SubState{
 		ClientID:      "me",
-		Inbox:         nuidGen.Next(),
-		AckInbox:      nuidGen.Next(),
+		Inbox:         nid.Next(),
+		AckInbox:      nid.Next(),
 		AckWaitInSecs: 10,
 	}
 	if err := ss.CreateSub(sub); err != nil {
@@ -198,7 +236,7 @@ func storeSub(t *testing.T, cs *Channel, channel string) uint64 {
 	return sub.ID
 }
 
-func storeSubPending(t *testing.T, cs *Channel, channel string, subID uint64, seqs ...uint64) {
+func storeSubPending(t tLogger, cs *Channel, channel string, subID uint64, seqs ...uint64) {
 	ss := cs.Subs
 	for _, s := range seqs {
 		if err := ss.AddSeqPending(subID, s); err != nil {
@@ -207,7 +245,7 @@ func storeSubPending(t *testing.T, cs *Channel, channel string, subID uint64, se
 	}
 }
 
-func storeSubAck(t *testing.T, cs *Channel, channel string, subID uint64, seqs ...uint64) {
+func storeSubAck(t tLogger, cs *Channel, channel string, subID uint64, seqs ...uint64) {
 	ss := cs.Subs
 	for _, s := range seqs {
 		if err := ss.AckSeqPending(subID, s); err != nil {
@@ -216,74 +254,182 @@ func storeSubAck(t *testing.T, cs *Channel, channel string, subID uint64, seqs .
 	}
 }
 
-func storeSubDelete(t *testing.T, cs *Channel, channel string, subID ...uint64) {
+func storeSubFlush(t tLogger, cs *Channel, channel string) {
+	if err := cs.Subs.Flush(); err != nil {
+		stackFatalf(t, "Error flushing sub store for channel %q: %v", channel, err)
+	}
+}
+
+func storeSubDelete(t tLogger, cs *Channel, channel string, subID ...uint64) {
 	ss := cs.Subs
 	for _, s := range subID {
 		subStoreDeleteSub(t, ss, s)
 	}
 }
 
-func getRecoveredChannel(t tLogger, state *RecoveredState, name string) *Channel {
+func getRecoveredChannel(t testing.TB, state *RecoveredState, name string) *Channel {
+	t.Helper()
 	if state == nil {
-		stackFatalf(t, "Expected state to be recovered")
+		t.Fatalf("Expected state to be recovered")
+		// For staticcheck SA5011
+		return nil
 	}
 	rc := state.Channels[name]
 	if rc == nil {
-		stackFatalf(t, "Channel %q should have been recovered", name)
+		t.Fatalf("Channel %q should have been recovered", name)
+		// For staticcheck SA5011
+		return nil
 	}
 	return rc.Channel
 }
 
-func getRecoveredSubs(t tLogger, state *RecoveredState, name string, expected int) []*RecoveredSubscription {
+func getRecoveredSubs(t testing.TB, state *RecoveredState, name string, expected int) []*RecoveredSubscription {
+	t.Helper()
 	if state == nil {
-		stackFatalf(t, "Expected state to be recovered")
+		t.Fatalf("Expected state to be recovered")
+		// For staticcheck SA5011
+		return nil
 	}
 	rc := state.Channels[name]
 	if rc == nil {
-		stackFatalf(t, "Channel %q should have been recovered", name)
+		t.Fatalf("Channel %q should have been recovered", name)
+		// For staticcheck SA5011
+		return nil
 	}
 	subs := rc.Subscriptions
 	if len(subs) != expected {
-		stackFatalf(t, "Channel %q should have %v subscriptions, got %v", name, expected, len(subs))
+		t.Fatalf("Channel %q should have %v subscriptions, got %v", name, expected, len(subs))
+		// For staticcheck SA5011
+		return nil
 	}
 	return subs
 }
 
-func startTest(t *testing.T, ts *testStore) Store {
+func startTest(t tLogger, ts *testStore) Store {
+	var s Store
 	switch ts.name {
 	case TypeMemory:
-		return createDefaultMemStore(t)
+		s = createDefaultMemStore(t)
 	case TypeFile:
-		cleanupDatastore(t)
-		return createDefaultFileStore(t)
+		cleanupFSDatastore(t)
+		s = createDefaultFileStore(t)
+	case TypeSQL:
+		cleanupSQLDatastore(t)
+		s = createDefaultSQLStore(t)
+	case TypeRaft:
+		cleanupRaftDatastore(t)
+		s = createDefaultRaftStore(t)
 	default:
-		stackFatalf(t, "Cannot start test for store type: ", ts.name)
+		// This is used with testStores table. If a store type has been
+		// added there, it needs to be added here.
+		panic(fmt.Sprintf("Add new store type %q in startTest", ts.name))
 	}
-	return nil
+	if testUseEncryption {
+		var err error
+		// Because tests work on parallel, and NewCryptoStore would clear
+		// the key, make a copy here to avoid races.
+		key := append([]byte(nil), testEncryptionKey...)
+		s, err = NewCryptoStore(s, CryptoCipherAES, key)
+		if err != nil {
+			stackFatalf(t, "Error creating crypto store: %v", err)
+		}
+	}
+	return s
 }
 
-func endTest(t *testing.T, ts *testStore) {
-	if ts.name == TypeFile {
-		cleanupDatastore(t)
+func endTest(t tLogger, ts *testStore) {
+	switch ts.name {
+	case TypeFile:
+		cleanupFSDatastore(t)
+	case TypeSQL:
+		cleanupSQLDatastore(t)
+	case TypeRaft:
+		cleanupRaftDatastore(t)
 	}
 }
 
-func testReOpenStore(t *testing.T, ts *testStore, limits *StoreLimits) (Store, *RecoveredState) {
+func testReOpenStore(t tLogger, ts *testStore, limits *StoreLimits) (Store, *RecoveredState) {
 	if !ts.recoverable {
 		stackFatalf(t, "Cannot reopen a store (%v) that is not recoverable", ts.name)
 	}
 	switch ts.name {
 	case TypeFile:
 		return openDefaultFileStoreWithLimits(t, limits)
+	case TypeSQL:
+		return openDefaultSQLStoreWithLimits(t, limits)
+	default:
+		// This is used with testStores table. If a recoverable
+		// store type has been added there, it needs to be added here.
+		panic(fmt.Sprintf("Add new store type %q in testReopenStore", ts.name))
 	}
-	return nil, nil
 }
 
+func isStorageBasedOnFile(s Store) bool {
+	var as Store
+	if cs, ok := s.(*CryptoStore); ok {
+		as = cs.Store
+	} else {
+		as = s
+	}
+	switch as.(type) {
+	case *FileStore:
+		return true
+	case *RaftStore:
+		return true
+	default:
+		return false
+	}
+}
+
+var doSQL bool
+var testUseEncryption bool
+var testEncryptionKey []byte
+
 func TestMain(m *testing.M) {
-	flag.BoolVar(&disableBufferWriters, "no_buffer", false, "Disable use of buffer writers")
-	flag.BoolVar(&setFDsLimit, "set_fds_limit", false, "Set some FDs limit")
+	var encryptionKey string
+
+	flag.BoolVar(&testFSDisableBufferWriters, "fs_no_buffer", false, "Disable use of buffer writers")
+	flag.BoolVar(&testFSDisableReadBuffer, "fs_no_read_buffer", false, "Disable use of read buffer")
+	flag.BoolVar(&testFSSetFDsLimit, "fs_set_fds_limit", false, "Set some FDs limit")
+	flag.BoolVar(&doSQL, "sql", true, "Set this to false if you don't want SQL to be tested")
+	test.AddSQLFlags(flag.CommandLine, &testSQLDriver, &testSQLSource, &testSQLSourceAdmin, &testSQLDatabaseName)
+	flag.BoolVar(&testUseEncryption, "encrypt", false, "Use encryption")
+	flag.StringVar(&encryptionKey, "encryption_key", "testkey", "Encryption key")
 	flag.Parse()
-	os.Exit(m.Run())
+
+	testEncryptionKey = []byte(encryptionKey)
+
+	if doSQL {
+		defaultSources := make(map[string][]string)
+		defaultSources[test.DriverMySQL] = []string{testDefaultMySQLSource, testDefaultMySQLSourceAdmin}
+		defaultSources[test.DriverPostgres] = []string{testDefaultPostgresSource, testDefaultPostgresSourceAdmin}
+		if err := test.ProcessSQLFlags(flag.CommandLine, defaultSources); err != nil {
+			fmt.Println(err.Error())
+			os.Exit(2)
+		}
+		// Create the SQL Database once, the cleanup is simply deleting
+		// content from tables (so we don't have to recreate them).
+		if err := test.CreateSQLDatabase(testSQLDriver, testSQLSourceAdmin,
+			testSQLSource, testSQLDatabaseName); err != nil {
+			fmt.Printf("Error initializing SQL Datastore: %v", err)
+			os.Exit(2)
+		}
+	} else {
+		// Remove SQL Store from the testStores array
+		newArray := []*testStore{}
+		for _, st := range testStores {
+			if st.name != TypeSQL {
+				newArray = append(newArray, st)
+			}
+		}
+		testStores = newArray
+	}
+	ret := m.Run()
+	if doSQL {
+		// Now that the tests/bench have all run, delete the database.
+		test.DeleteSQLDatabase(testSQLDriver, testSQLSourceAdmin, testSQLDatabaseName)
+	}
+	os.Exit(ret)
 }
 
 func TestGSNoOps(t *testing.T) {
@@ -322,10 +468,11 @@ func TestGSNoOps(t *testing.T) {
 		msgStoreLastMsg(t, gms) != nil ||
 		gms.Flush() != nil ||
 		msgStoreGetSequenceFromTimestamp(t, gms, 0) != 0 ||
+		gms.Empty() != nil ||
 		gms.Close() != nil {
 		t.Fatal("Expected no value since these should not be implemented for generic store")
 	}
-	if seq, err := gms.Store([]byte("hello")); seq != 0 || err != nil {
+	if seq, err := gms.Store(&pb.MsgProto{Data: []byte("hello")}); seq != 0 || err != nil {
 		t.Fatal("Expected no value since this should not be implemented for generic store")
 	}
 
@@ -350,8 +497,17 @@ func TestCSBasicCreate(t *testing.T) {
 			s := startTest(t, st)
 			defer s.Close()
 
-			if s.Name() != st.name {
-				t.Fatalf("Expecting name to be %q, got %q", st.name, s.Name())
+			expectedName := st.name
+			if st.name == TypeRaft {
+				if cs, ok := s.(*CryptoStore); ok {
+					expectedName = TypeRaft + "_" + cs.Store.(*RaftStore).Store.Name()
+				} else {
+					expectedName = TypeRaft + "_" + s.(*RaftStore).Store.Name()
+				}
+			}
+
+			if s.Name() != expectedName {
+				t.Fatalf("Expecting name to be %q, got %q", expectedName, s.Name())
 			}
 		})
 	}
@@ -363,7 +519,29 @@ func TestCSInit(t *testing.T) {
 		t.Run(st.name, func(t *testing.T) {
 			t.Parallel()
 			defer endTest(t, st)
-			s := startTest(t, st)
+
+			var (
+				s   Store
+				err error
+			)
+			switch st.name {
+			case TypeMemory:
+				s, err = NewMemoryStore(testLogger, nil)
+			case TypeFile:
+				s, err = NewFileStore(testLogger, testFSDefaultDatastore, nil)
+			case TypeSQL:
+				s, err = NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil)
+			case TypeRaft:
+				s, err = NewFileStore(testLogger, testRSDefaultDatastore, nil)
+				if err == nil {
+					s = NewRaftStore(testLogger, s, nil)
+				}
+			default:
+				panic(fmt.Errorf("Add store type %q in this test", st.name))
+			}
+			if err != nil {
+				t.Fatalf("Error creating store: %v", err)
+			}
 			defer s.Close()
 
 			info := spb.ServerInfo{
@@ -439,7 +617,7 @@ func TestCSBasicRecovery(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Recover should not return an error, got %v", err)
 				}
-				if state != nil {
+				if st.name != TypeRaft && state != nil {
 					t.Fatalf("State should be nil, got %v", state)
 				}
 				// We are done for non recoverable stores.
@@ -454,16 +632,16 @@ func TestCSBasicRecovery(t *testing.T) {
 
 			cFoo := storeCreateChannel(t, s, "foo")
 
-			foo1 := storeMsg(t, cFoo, "foo", []byte("foomsg"))
-			foo2 := storeMsg(t, cFoo, "foo", []byte("foomsg"))
-			foo3 := storeMsg(t, cFoo, "foo", []byte("foomsg"))
+			foo1 := storeMsg(t, cFoo, "foo", 1, []byte("foomsg"))
+			foo2 := storeMsg(t, cFoo, "foo", 2, []byte("foomsg"))
+			foo3 := storeMsg(t, cFoo, "foo", 3, []byte("foomsg"))
 
 			cBar := storeCreateChannel(t, s, "bar")
 
-			bar1 := storeMsg(t, cBar, "bar", []byte("barmsg"))
-			bar2 := storeMsg(t, cBar, "bar", []byte("barmsg"))
-			bar3 := storeMsg(t, cBar, "bar", []byte("barmsg"))
-			bar4 := storeMsg(t, cBar, "bar", []byte("barmsg"))
+			bar1 := storeMsg(t, cBar, "bar", 1, []byte("barmsg"))
+			bar2 := storeMsg(t, cBar, "bar", 2, []byte("barmsg"))
+			bar3 := storeMsg(t, cBar, "bar", 3, []byte("barmsg"))
+			bar4 := storeMsg(t, cBar, "bar", 4, []byte("barmsg"))
 
 			sub1 := storeSub(t, cFoo, "foo")
 			sub2 := storeSub(t, cBar, "bar")
@@ -730,7 +908,7 @@ func TestCSFlush(t *testing.T) {
 			defer s.Close()
 
 			cs := storeCreateChannel(t, s, "foo")
-			seq, err := cs.Msgs.Store([]byte("hello"))
+			seq, err := cs.Msgs.Store(&pb.MsgProto{Sequence: 1, Data: []byte("hello")})
 			if err != nil {
 				t.Fatalf("Unexpected error on store: %v", err)
 			}
@@ -750,11 +928,11 @@ func TestCSFlush(t *testing.T) {
 
 			if st.name == TypeFile {
 				// Now specific tests to File store
-				msg := storeMsg(t, cs, "foo", []byte("new msg"))
+				msg := storeMsg(t, cs, "foo", 2, []byte("new msg"))
 				subID := storeSub(t, cs, "foo")
 				storeSubPending(t, cs, "foo", subID, msg.Sequence)
 				// Close the underlying file
-				ms := cs.Msgs.(*FileMsgStore)
+				ms := getFileMsgStore(cs.Msgs)
 				ms.Lock()
 				ms.writeSlice.file.handle.Close()
 				ms.Unlock()
@@ -781,7 +959,7 @@ func TestCSFlush(t *testing.T) {
 				// not expected to fail.
 				cs = getRecoveredChannel(t, state, "foo")
 				// Close the underlying file
-				ms = cs.Msgs.(*FileMsgStore)
+				ms = getFileMsgStore(cs.Msgs)
 				ms.Lock()
 				ms.writeSlice.file.handle.Close()
 				ms.Unlock()
@@ -815,6 +993,8 @@ func TestCSPerChannelLimits(t *testing.T) {
 			s := startTest(t, st)
 			defer s.Close()
 
+			oc := storeCreateChannel(t, s, "overhead")
+
 			storeLimits := &StoreLimits{MaxChannels: 10}
 			storeLimits.MaxSubscriptions = 10
 			storeLimits.MaxMsgs = 100
@@ -828,6 +1008,7 @@ func TestCSPerChannelLimits(t *testing.T) {
 				SubStoreLimits{
 					MaxSubscriptions: 1,
 				},
+				0,
 			}
 			barLimits := ChannelLimits{
 				MsgStoreLimits{
@@ -837,6 +1018,7 @@ func TestCSPerChannelLimits(t *testing.T) {
 				SubStoreLimits{
 					MaxSubscriptions: 2,
 				},
+				0,
 			}
 			noSubsOverrideLimits := ChannelLimits{
 				MsgStoreLimits{
@@ -844,18 +1026,24 @@ func TestCSPerChannelLimits(t *testing.T) {
 					MaxBytes: 6 * 1024,
 				},
 				SubStoreLimits{},
+				0,
 			}
 			noMaxMsgOverrideLimits := ChannelLimits{
 				MsgStoreLimits{
 					MaxBytes: 7 * 1024,
 				},
 				SubStoreLimits{},
+				0,
+			}
+			if testUseEncryption {
+				noMaxMsgOverrideLimits.MaxBytes += int64(100 * getCryptoOverhead(oc.Msgs))
 			}
 			noMaxBytesOverrideLimits := ChannelLimits{
 				MsgStoreLimits{
 					MaxMsgs: 10,
 				},
 				SubStoreLimits{},
+				0,
 			}
 
 			storeLimits.AddPerChannel("foo", &fooLimits)
@@ -867,31 +1055,30 @@ func TestCSPerChannelLimits(t *testing.T) {
 				t.Fatalf("Unexpected error setting limits: %v", err)
 			}
 
-			checkLimitsForChannel := func(channelName string, maxMsgs, maxSubs int) {
+			checkLimitsForChannel := func(t *testing.T, channelName string, maxMsgs, maxSubs int) {
+				t.Helper()
 				cs := storeCreateChannel(t, s, channelName)
 				for i := 0; i < maxMsgs+10; i++ {
-					if _, err := cs.Msgs.Store([]byte("hello")); err != nil {
-						stackFatalf(t, "Unexpected error on store: %v", err)
-					}
+					storeMsg(t, cs, channelName, uint64(i+1), []byte("hello"))
 				}
 				if n, _ := msgStoreState(t, cs.Msgs); n != maxMsgs {
-					stackFatalf(t, "Expected %v messages, got %v", maxMsgs, n)
+					t.Fatalf("Expected %v messages, got %v", maxMsgs, n)
 				}
 				for i := 0; i < maxSubs+1; i++ {
 					err := cs.Subs.CreateSub(&spb.SubState{})
 					if i < maxSubs && err != nil {
-						stackFatalf(t, "Unexpected error on create sub: %v", err)
+						t.Fatalf("Unexpected error on create sub: %v", err)
 					} else if i == maxSubs && err == nil {
-						stackFatalf(t, "Expected error on createSub, did not get one")
+						t.Fatalf("Expected error on createSub, did not get one")
 					}
 				}
 			}
-			checkLimitsForChannel("foo", fooLimits.MaxMsgs, fooLimits.MaxSubscriptions)
-			checkLimitsForChannel("bar", barLimits.MaxMsgs, barLimits.MaxSubscriptions)
-			checkLimitsForChannel("baz", noSubsOverrideLimits.MaxMsgs, storeLimits.MaxSubscriptions)
-			checkLimitsForChannel("abc", storeLimits.MaxMsgs, storeLimits.MaxSubscriptions)
-			checkLimitsForChannel("def", noMaxBytesOverrideLimits.MaxMsgs, storeLimits.MaxSubscriptions)
-			checkLimitsForChannel("global", storeLimits.MaxMsgs, storeLimits.MaxSubscriptions)
+			checkLimitsForChannel(t, "foo", fooLimits.MaxMsgs, fooLimits.MaxSubscriptions)
+			checkLimitsForChannel(t, "bar", barLimits.MaxMsgs, barLimits.MaxSubscriptions)
+			checkLimitsForChannel(t, "baz", noSubsOverrideLimits.MaxMsgs, storeLimits.MaxSubscriptions)
+			checkLimitsForChannel(t, "abc", storeLimits.MaxMsgs, storeLimits.MaxSubscriptions)
+			checkLimitsForChannel(t, "def", noMaxBytesOverrideLimits.MaxMsgs, storeLimits.MaxSubscriptions)
+			checkLimitsForChannel(t, "global", storeLimits.MaxMsgs, storeLimits.MaxSubscriptions)
 		})
 	}
 }
@@ -950,23 +1137,174 @@ func TestCSLimitWithWildcardsInConfig(t *testing.T) {
 			s.SetLimits(l)
 			foobar := "foo.bar"
 			cFooBar := storeCreateChannel(t, s, foobar)
-			m1 := storeMsg(t, cFooBar, foobar, []byte("msg1"))
-			storeMsg(t, cFooBar, foobar, []byte("msg2"))
+			m1 := storeMsg(t, cFooBar, foobar, 1, []byte("msg1"))
+			storeMsg(t, cFooBar, foobar, 2, []byte("msg2"))
 			// This should kick out m1 since for foo.bar, limit will be 2
-			storeMsg(t, cFooBar, foobar, []byte("msg3"))
+			storeMsg(t, cFooBar, foobar, 3, []byte("msg3"))
 			if msgStoreLookup(t, cFooBar.Msgs, m1.Sequence) != nil {
 				stackFatalf(t, "M1 should have been removed")
 			}
 			// For bar, however, we should be able to store 3 messages
 			bar := "bar"
 			cBar := storeCreateChannel(t, s, bar)
-			m1 = storeMsg(t, cBar, bar, []byte("msg1"))
-			storeMsg(t, cBar, bar, []byte("msg2"))
-			storeMsg(t, cBar, bar, []byte("msg3"))
+			m1 = storeMsg(t, cBar, bar, 1, []byte("msg1"))
+			storeMsg(t, cBar, bar, 2, []byte("msg2"))
+			storeMsg(t, cBar, bar, 3, []byte("msg3"))
 			// Now, a 4th one should evict m1
-			storeMsg(t, cBar, bar, []byte("msg4"))
+			storeMsg(t, cBar, bar, 4, []byte("msg4"))
 			if msgStoreLookup(t, cBar.Msgs, m1.Sequence) != nil {
 				stackFatalf(t, "M1 should have been removed")
+			}
+		})
+	}
+}
+
+func TestCSGetChannelLimits(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			limits := &StoreLimits{}
+			limits.MaxChannels = 10
+			limits.MaxMsgs = 20
+			limits.MaxBytes = 30
+			limits.MaxAge = 40
+			limits.MaxSubscriptions = 50
+			limits.MaxInactivity = 60
+
+			clFooStar := &ChannelLimits{}
+			clFooStar.MaxMsgs = 70
+			clFooStar.MaxInactivity = -1
+			limits.AddPerChannel("foo.*", clFooStar)
+
+			if err := s.SetLimits(limits); err != nil {
+				t.Fatalf("Error setting limits: %v", err)
+			}
+
+			// The store owns a copy of the limits and inheritance
+			// has been applied in that copy, not with the limits
+			// given by the caller. So for the rest of the test
+			// we need to apply inheritance to limits.
+			if err := limits.Build(); err != nil {
+				t.Fatalf("Error building limits: %v", err)
+			}
+			clFooStar = limits.PerChannel["foo.*"]
+
+			// Check for non existing channel
+			cl := s.GetChannelLimits("unknown")
+			if cl != nil {
+				t.Fatalf("Should have returned nil, returned %v", cl)
+			}
+
+			// This channel should have same limits than foo.*
+			storeCreateChannel(t, s, "foo.bar")
+			cl = s.GetChannelLimits("foo.bar")
+			if cl == nil {
+				t.Fatal("Should have returned the channel limits")
+			}
+			if !reflect.DeepEqual(clFooStar, cl) {
+				t.Fatalf("Expected channel limits to be %+v, got %+v", clFooStar, cl)
+			}
+
+			// This channel should have same limits than the global ones
+			storeCreateChannel(t, s, "foo")
+			cl = s.GetChannelLimits("foo")
+			if cl == nil {
+				t.Fatal("Should have returned the channel limits")
+			}
+			if !reflect.DeepEqual(&limits.ChannelLimits, cl) {
+				t.Fatalf("Expected channel limits to be %+v, got %+v", &limits.ChannelLimits, cl)
+			}
+
+			// Check that the returned value is a copy
+			cl.MaxBytes = 2
+			newCL := s.GetChannelLimits("foo")
+			if newCL == nil {
+				t.Fatal("Should have returned the channel limits")
+			}
+			// There should be different
+			if reflect.DeepEqual(cl, newCL) {
+				t.Fatal("These should have been different")
+			}
+			// newCL should be same than global limits
+			if !reflect.DeepEqual(&limits.ChannelLimits, newCL) {
+				t.Fatalf("Expected channel limits to be %+v, got %+v", &limits.ChannelLimits, newCL)
+			}
+		})
+	}
+}
+
+func TestCSDeleteChannel(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			if err := s.DeleteChannel("notfound"); err != ErrNotFound {
+				t.Fatalf("Expected %v error, got %v", ErrNotFound, err)
+			}
+			storeCreateChannel(t, s, "foo")
+			if err := s.DeleteChannel("foo"); err != nil {
+				t.Fatalf("Error on delete: %v", err)
+			}
+
+			if !st.recoverable {
+				return
+			}
+			// Restart the store and ensure channel "foo" is not reconvered
+			s.Close()
+			s, state := testReOpenStore(t, st, nil)
+			defer s.Close()
+			if state != nil && len(state.Channels) > 0 {
+				t.Fatal("Channel recovered after restart")
+			}
+		})
+	}
+}
+
+func TestCSAddClientProto(t *testing.T) {
+	for _, st := range testStores {
+		if !st.recoverable {
+			continue
+		}
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			info := &spb.ClientInfo{
+				ID:       "me",
+				HbInbox:  "hbInbox",
+				ConnID:   []byte("connID"),
+				Protocol: 1,
+			}
+			c, err := s.AddClient(info)
+			if err != nil {
+				t.Fatalf("Error adding client: %v", err)
+			}
+			if !reflect.DeepEqual(&c.ClientInfo, info) {
+				t.Fatalf("Expected %v, got %v", info, c.ClientInfo)
+			}
+			s.Close()
+
+			s, state := testReOpenStore(t, st, nil)
+			defer s.Close()
+
+			if l := len(state.Clients); l != 1 {
+				t.Fatalf("Expected to have recovered 1 client, got %v", l)
+			}
+			rc := state.Clients[0]
+			if !reflect.DeepEqual(c, rc) {
+				t.Fatalf("Expected %v, got %v", c, rc)
 			}
 		})
 	}

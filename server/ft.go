@@ -1,4 +1,15 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2017-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -7,10 +18,10 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/nats-io/go-nats"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/nats-streaming-server/util"
+	"github.com/nats-io/nats.go"
 )
 
 // FT constants
@@ -62,8 +73,11 @@ func (s *StanServer) ftStart() (retErr error) {
 		}
 		locked, err := s.ftGetStoreLock()
 		if err != nil {
-			// This is considered a fatal error and we exit
-			return err
+			// Log the error, but go back and wait for the next interval and
+			// try again. It is possible that the error resolves (for instance
+			// the connection to the database is restored - for SQL stores).
+			s.log.Errorf("ft: error attempting to get the store lock: %v", err)
+			continue
 		} else if locked {
 			break
 		}
@@ -172,8 +186,8 @@ func (s *StanServer) ftSendHBLoop(activationTime time.Time) {
 // so this parameter is not checked here.
 func (s *StanServer) ftSetup() error {
 	// Check that store type is ok. So far only support for FileStore
-	if s.opts.StoreType != stores.TypeFile {
-		return fmt.Errorf("ft: only %v stores supported in FT mode", stores.TypeFile)
+	if s.opts.StoreType != stores.TypeFile && s.opts.StoreType != stores.TypeSQL {
+		return fmt.Errorf("ft: only %v or %v stores supported in FT mode", stores.TypeFile, stores.TypeSQL)
 	}
 	// So far, those are not exposed to users, just used in tests.
 	// Still make sure that the missed HB interval is > than the HB

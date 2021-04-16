@@ -1,30 +1,40 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2021 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/nats-io/gnatsd/conf"
-	natsd "github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/conf"
+	natsd "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/nats-streaming-server/util"
 )
 
+func init() {
+	natsd.NoErrOnUnknownFields(true)
+}
+
 // ProcessConfigFile parses the configuration file `configFile` and updates
 // the given Streaming options `opts`.
 func ProcessConfigFile(configFile string, opts *Options) error {
-	data, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		return err
-	}
-	m, err := conf.Parse(string(data))
+	m, err := conf.ParseFile(configFile)
 	if err != nil {
 		return err
 	}
@@ -58,11 +68,10 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 			if err := checkType(k, reflect.String, v); err != nil {
 				return err
 			}
-			switch strings.ToUpper(v.(string)) {
-			case stores.TypeFile:
-				opts.StoreType = stores.TypeFile
-			case stores.TypeMemory:
-				opts.StoreType = stores.TypeMemory
+			st := strings.ToUpper(v.(string))
+			switch st {
+			case stores.TypeFile, stores.TypeMemory, stores.TypeSQL:
+				opts.StoreType = st
 			default:
 				return fmt.Errorf("unknown store type: %v", v.(string))
 			}
@@ -86,6 +95,11 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.NATSServerURL = v.(string)
+		case "credentials":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.NATSCredentials = v.(string)
 		case "secure":
 			if err := checkType(k, reflect.Bool, v); err != nil {
 				return err
@@ -101,6 +115,10 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 			}
 		case "file", "file_options":
 			if err := parseFileOptions(v, opts); err != nil {
+				return err
+			}
+		case "sql", "sql_options":
+			if err := parseSQLOptions(v, opts); err != nil {
 				return err
 			}
 		case "hbi", "hb_interval", "server_to_client_hb_interval":
@@ -126,11 +144,6 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.ClientHBFailCount = int(v.(int64))
-		case "ack_subs_pool_size", "ack_subscriptions_pool_size":
-			if err := checkType(k, reflect.Int64, v); err != nil {
-				return err
-			}
-			opts.AckSubsPoolSize = int(v.(int64))
 		case "ft_group", "ft_group_name":
 			if err := checkType(k, reflect.String, v); err != nil {
 				return err
@@ -141,6 +154,56 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.Partitioning = v.(bool)
+		case "cluster":
+			if err := parseCluster(v, opts); err != nil {
+				return err
+			}
+		case "syslog_name":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.SyslogName = v.(string)
+		case "encrypt":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Encrypt = v.(bool)
+		case "encryption_cipher":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.EncryptionCipher = v.(string)
+		case "encryption_key":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Encrypt = true
+			opts.EncryptionKey = []byte(v.(string))
+		case "username", "user":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Username = v.(string)
+		case "password", "pass":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Password = v.(string)
+		case "token":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Token = v.(string)
+		case "nkey_seed_file":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.NKeySeedFile = v.(string)
+		case "replace_durable", "replace_durables", "replace_duplicate_durable", "replace_duplicate_durables":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.ReplaceDurable = v.(bool)
 		}
 	}
 	return nil
@@ -180,6 +243,129 @@ func parseTLS(itf interface{}, opts *Options) error {
 				return err
 			}
 			opts.ClientCA = v.(string)
+		case "server_name", "server_hostname":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.TLSServerName = v.(string)
+		case "skip_verify", "insecure":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.TLSSkipVerify = v.(bool)
+		}
+	}
+	return nil
+}
+
+// parseCluster updates `opts` with cluster config
+func parseCluster(itf interface{}, opts *Options) error {
+	m, ok := itf.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("expected cluster to be a map/struct, got %v", itf)
+	}
+	opts.Clustering.Clustered = true
+	for k, v := range m {
+		name := strings.ToLower(k)
+		switch name {
+		case "node_id":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Clustering.NodeID = v.(string)
+		case "bootstrap":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.Bootstrap = v.(bool)
+		case "peers":
+			if err := checkType(k, reflect.Slice, v); err != nil {
+				return err
+			}
+			peers := make([]string, len(v.([]interface{})))
+			for i, p := range v.([]interface{}) {
+				peers[i] = p.(string)
+			}
+			opts.Clustering.Peers = peers
+		case "log_path":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Clustering.RaftLogPath = v.(string)
+		case "log_cache_size":
+			if err := checkType(k, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.Clustering.LogCacheSize = int(v.(int64))
+		case "log_snapshots":
+			if err := checkType(k, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.Clustering.LogSnapshots = int(v.(int64))
+		case "trailing_logs":
+			if err := checkType(k, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.Clustering.TrailingLogs = v.(int64)
+		case "sync":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.Sync = v.(bool)
+		case "proceed_on_restore_failure":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.ProceedOnRestoreFailure = v.(bool)
+		case "allow_add_remove_node":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.AllowAddRemoveNode = v.(bool)
+		case "raft_logging":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.RaftLogging = v.(bool)
+		case "raft_heartbeat_timeout":
+			fallthrough
+		case "raft_election_timeout":
+			fallthrough
+		case "raft_lease_timeout":
+			fallthrough
+		case "raft_commit_timeout":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			switch name {
+			case "raft_heartbeat_timeout":
+				opts.Clustering.RaftHeartbeatTimeout = dur
+			case "raft_election_timeout":
+				opts.Clustering.RaftElectionTimeout = dur
+			case "raft_lease_timeout":
+				opts.Clustering.RaftLeaseTimeout = dur
+			case "raft_commit_timeout":
+				opts.Clustering.RaftCommitTimeout = dur
+			}
+		case "bolt_free_list_sync":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.BoltFreeListSync = v.(bool)
+		case "bolt_free_list_map":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.BoltFreeListMap = v.(bool)
+		case "nodes_connections":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Clustering.NodesConnections = v.(bool)
 		}
 	}
 	return nil
@@ -251,6 +437,18 @@ func parseChannelLimits(cl *stores.ChannelLimits, k, name string, v interface{},
 		cl.MaxAge = dur
 		if !isGlobal && cl.MaxAge == 0 {
 			cl.MaxAge = -1
+		}
+	case "mi", "max_inactivity", "maxinactivity":
+		if err := checkType(k, reflect.String, v); err != nil {
+			return err
+		}
+		dur, err := time.ParseDuration(v.(string))
+		if err != nil {
+			return err
+		}
+		cl.MaxInactivity = dur
+		if !isGlobal && cl.MaxInactivity == 0 {
+			cl.MaxInactivity = -1
 		}
 	}
 	return nil
@@ -365,6 +563,58 @@ func parseFileOptions(itf interface{}, opts *Options) error {
 				return err
 			}
 			opts.FileStoreOpts.ParallelRecovery = int(v.(int64))
+		case "file_read_buffer_size", "read_buffer_size":
+			if err := checkType(k, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.FileStoreOpts.ReadBufferSize = int(v.(int64))
+		case "file_auto_sync", "auto_sync":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			opts.FileStoreOpts.AutoSync = dur
+		}
+	}
+	return nil
+}
+
+func parseSQLOptions(itf interface{}, opts *Options) error {
+	m, ok := itf.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("expected SQL options to be a map/struct, got %v", itf)
+	}
+	for k, v := range m {
+		name := strings.ToLower(k)
+		switch name {
+		case "driver":
+			if err := checkType(name, reflect.String, v); err != nil {
+				return err
+			}
+			opts.SQLStoreOpts.Driver = v.(string)
+		case "source":
+			if err := checkType(name, reflect.String, v); err != nil {
+				return err
+			}
+			opts.SQLStoreOpts.Source = v.(string)
+		case "no_caching":
+			if err := checkType(name, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.SQLStoreOpts.NoCaching = v.(bool)
+		case "max_open_conns", "max_conns":
+			if err := checkType(name, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.SQLStoreOpts.MaxOpenConns = int(v.(int64))
+		case "bulk_insert_limit":
+			if err := checkType(name, reflect.Int64, v); err != nil {
+				return err
+			}
+			opts.SQLStoreOpts.BulkInsertLimit = int(v.(int64))
 		}
 	}
 	return nil
@@ -381,6 +631,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	var (
 		stanConfigFile string
 		natsConfigFile string
+		clusterPeers   string
+		encryptionKey  string
 	)
 
 	fs.StringVar(&sopts.ID, "cluster_id", DefaultClusterID, "stan.ID")
@@ -398,6 +650,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.String("mb", fmt.Sprintf("%v", stores.DefaultStoreLimits.MaxBytes), "stan.MaxBytes")
 	fs.DurationVar(&sopts.MaxAge, "max_age", stores.DefaultStoreLimits.MaxAge, "stan.MaxAge")
 	fs.DurationVar(&sopts.MaxAge, "ma", stores.DefaultStoreLimits.MaxAge, "stan.MaxAge")
+	fs.DurationVar(&sopts.MaxInactivity, "max_inactivity", stores.DefaultStoreLimits.MaxInactivity, "Maximum inactivity (no new message, no subscription) after which a channel can be garbage collected")
+	fs.DurationVar(&sopts.MaxInactivity, "mi", stores.DefaultStoreLimits.MaxInactivity, "Maximum inactivity (no new message, no subscription) after which a channel can be garbage collected")
 	fs.DurationVar(&sopts.ClientHBInterval, "hbi", DefaultHeartBeatInterval, "stan.ClientHBInterval")
 	fs.DurationVar(&sopts.ClientHBInterval, "hb_interval", DefaultHeartBeatInterval, "stan.ClientHBInterval")
 	fs.DurationVar(&sopts.ClientHBTimeout, "hbt", DefaultClientHBTimeout, "stan.ClientHBTimeout")
@@ -417,12 +671,12 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&sopts.NATSServerURL, "ns", "", "stan.NATSServerURL")
 	fs.StringVar(&stanConfigFile, "sc", "", "")
 	fs.StringVar(&stanConfigFile, "stan_config", "", "")
-	fs.IntVar(&sopts.AckSubsPoolSize, "ack_subs", 0, "stan.AckSubsPoolSize")
 	fs.BoolVar(&sopts.FileStoreOpts.CompactEnabled, "file_compact_enabled", stores.DefaultFileStoreOptions.CompactEnabled, "stan.FileStoreOpts.CompactEnabled")
 	fs.IntVar(&sopts.FileStoreOpts.CompactFragmentation, "file_compact_frag", stores.DefaultFileStoreOptions.CompactFragmentation, "stan.FileStoreOpts.CompactFragmentation")
 	fs.IntVar(&sopts.FileStoreOpts.CompactInterval, "file_compact_interval", stores.DefaultFileStoreOptions.CompactInterval, "stan.FileStoreOpts.CompactInterval")
 	fs.String("file_compact_min_size", fmt.Sprintf("%v", stores.DefaultFileStoreOptions.CompactMinFileSize), "stan.FileStoreOpts.CompactMinFileSize")
 	fs.String("file_buffer_size", fmt.Sprintf("%v", stores.DefaultFileStoreOptions.BufferSize), "stan.FileStoreOpts.BufferSize")
+	fs.String("file_read_buffer_size", fmt.Sprintf("%v", stores.DefaultFileStoreOptions.ReadBufferSize), "")
 	fs.BoolVar(&sopts.FileStoreOpts.DoCRC, "file_crc", stores.DefaultFileStoreOptions.DoCRC, "stan.FileStoreOpts.DoCRC")
 	fs.Int64Var(&sopts.FileStoreOpts.CRCPolynomial, "file_crc_poly", stores.DefaultFileStoreOptions.CRCPolynomial, "stan.FileStoreOpts.CRCPolynomial")
 	fs.BoolVar(&sopts.FileStoreOpts.DoSync, "file_sync", stores.DefaultFileStoreOptions.DoSync, "stan.FileStoreOpts.DoSync")
@@ -432,9 +686,34 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&sopts.FileStoreOpts.SliceArchiveScript, "file_slice_archive_script", "", "stan.FileStoreOpts.SliceArchiveScript")
 	fs.Int64Var(&sopts.FileStoreOpts.FileDescriptorsLimit, "file_fds_limit", stores.DefaultFileStoreOptions.FileDescriptorsLimit, "stan.FileStoreOpts.FileDescriptorsLimit")
 	fs.IntVar(&sopts.FileStoreOpts.ParallelRecovery, "file_parallel_recovery", stores.DefaultFileStoreOptions.ParallelRecovery, "stan.FileStoreOpts.ParallelRecovery")
+	fs.BoolVar(&sopts.FileStoreOpts.TruncateUnexpectedEOF, "file_truncate_bad_eof", stores.DefaultFileStoreOptions.TruncateUnexpectedEOF, "Truncate files for which there is an unexpected EOF on recovery, dataloss may occur")
+	fs.DurationVar(&sopts.FileStoreOpts.AutoSync, "file_auto_sync", stores.DefaultFileStoreOptions.AutoSync, "Interval at which the store should be automatically flushed and sync'ed on disk (<= 0 to disable)")
 	fs.IntVar(&sopts.IOBatchSize, "io_batch_size", DefaultIOBatchSize, "stan.IOBatchSize")
 	fs.Int64Var(&sopts.IOSleepTime, "io_sleep_time", DefaultIOSleepTime, "stan.IOSleepTime")
 	fs.StringVar(&sopts.FTGroupName, "ft_group", "", "stan.FTGroupName")
+	fs.BoolVar(&sopts.Clustering.Clustered, "clustered", false, "stan.Clustering.Clustered")
+	fs.StringVar(&sopts.Clustering.NodeID, "cluster_node_id", "", "stan.Clustering.NodeID")
+	fs.BoolVar(&sopts.Clustering.Bootstrap, "cluster_bootstrap", false, "stan.Clustering.Bootstrap")
+	fs.StringVar(&clusterPeers, "cluster_peers", "", "stan.Clustering.Peers")
+	fs.StringVar(&sopts.Clustering.RaftLogPath, "cluster_log_path", "", "stan.Clustering.RaftLogPath")
+	fs.IntVar(&sopts.Clustering.LogCacheSize, "cluster_log_cache_size", DefaultLogCacheSize, "stan.Clustering.LogCacheSize")
+	fs.IntVar(&sopts.Clustering.LogSnapshots, "cluster_log_snapshots", DefaultLogSnapshots, "stan.Clustering.LogSnapshots")
+	fs.Int64Var(&sopts.Clustering.TrailingLogs, "cluster_trailing_logs", DefaultTrailingLogs, "stan.Clustering.TrailingLogs")
+	fs.BoolVar(&sopts.Clustering.Sync, "cluster_sync", false, "stan.Clustering.Sync")
+	fs.BoolVar(&sopts.Clustering.RaftLogging, "cluster_raft_logging", false, "")
+	fs.BoolVar(&sopts.Clustering.ProceedOnRestoreFailure, "cluster_proceed_on_restore_failure", false, "")
+	fs.BoolVar(&sopts.Clustering.AllowAddRemoveNode, "cluster_allow_add_remove_node", false, "")
+	fs.StringVar(&sopts.SQLStoreOpts.Driver, "sql_driver", "", "SQL Driver")
+	fs.StringVar(&sopts.SQLStoreOpts.Source, "sql_source", "", "SQL Data Source")
+	defSQLOpts := stores.DefaultSQLStoreOptions()
+	fs.BoolVar(&sopts.SQLStoreOpts.NoCaching, "sql_no_caching", defSQLOpts.NoCaching, "Enable/Disable caching")
+	fs.IntVar(&sopts.SQLStoreOpts.MaxOpenConns, "sql_max_open_conns", defSQLOpts.MaxOpenConns, "Max opened connections to the database")
+	fs.IntVar(&sopts.SQLStoreOpts.BulkInsertLimit, "sql_bulk_insert_limit", 0, "Limit the number of messages inserted in one SQL query")
+	fs.StringVar(&sopts.SyslogName, "syslog_name", "", "Syslog Name")
+	fs.BoolVar(&sopts.Encrypt, "encrypt", false, "Specify if server should use encryption at rest")
+	fs.StringVar(&sopts.EncryptionCipher, "encryption_cipher", stores.CryptoCipherAutoSelect, "Encryption cipher. Supported are AES and CHACHA (default is AES)")
+	fs.StringVar(&encryptionKey, "encryption_key", "", "Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead")
+	fs.BoolVar(&sopts.ReplaceDurable, "replace_durable", false, "Replace the existing durable subscription instead of reporting a duplicate durable error")
 
 	// First, we need to call NATS's ConfigureOptions() with above flag set.
 	// It will be augmented with NATS specific flags and call fs.Parse(args) for us.
@@ -445,6 +724,20 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	// At this point, if NATS config file was specified in the command line (-c of -config)
 	// nopts.ConfigFile will not be empty.
 	natsConfigFile = nopts.ConfigFile
+
+	if clusterPeers != "" {
+		sopts.Clustering.Peers = []string{}
+		for _, p := range strings.Split(clusterPeers, ",") {
+			if p = strings.TrimSpace(p); p != sopts.Clustering.NodeID {
+				sopts.Clustering.Peers = append(sopts.Clustering.Peers, p)
+			}
+		}
+	}
+
+	if encryptionKey != "" {
+		sopts.Encrypt = true
+		sopts.EncryptionKey = []byte(encryptionKey)
+	}
 
 	// If both nats and streaming configuration files are used, then
 	// we only use the config file for the corresponding module.
@@ -491,6 +784,12 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 			var i64 int64
 			i64, flagErr = getBytes(f)
 			sopts.FileStoreOpts.BufferSize = int(i64)
+		case "file_read_buffer_size":
+			var i64 int64
+			i64, flagErr = getBytes(f)
+			sopts.FileStoreOpts.ReadBufferSize = int(i64)
+		case "file_slice_max_bytes":
+			sopts.FileStoreOpts.SliceMaxBytes, flagErr = getBytes(f)
 		}
 	})
 	if flagErr != nil {

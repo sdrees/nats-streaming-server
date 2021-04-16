@@ -1,4 +1,15 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
@@ -6,15 +17,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/util"
+	"github.com/nats-io/stan.go/pb"
 )
 
 // format string used to report that limit is reached when storing
 // messages.
-var droppingMsgsFmt = "WARNING: Reached limits for store %q (msgs=%v/%v bytes=%v/%v), " +
+var droppingMsgsFmt = "Reached limits for store %q (msgs=%v/%v bytes=%v/%v), " +
 	"dropping old messages to make room for new ones"
 
 // commonStore contains everything that is common to any type of store
@@ -53,7 +64,6 @@ type genericMsgStore struct {
 	subject    string // Can't be wildcard
 	first      uint64
 	last       uint64
-	lTimestamp int64 // Timestamp of last message
 	totalCount int
 	totalBytes uint64
 	hitLimit   bool // indicates if store had to drop messages due to limit
@@ -138,6 +148,19 @@ func (gs *genericStore) getChannelLimits(channel string) *ChannelLimits {
 	return r[len(r)-1].(*ChannelLimits)
 }
 
+// GetChannelLimits implements the Store interface
+func (gs *genericStore) GetChannelLimits(channel string) *ChannelLimits {
+	gs.RLock()
+	defer gs.RUnlock()
+	c := gs.channels[channel]
+	if c == nil {
+		return nil
+	}
+	// Return a copy
+	cl := *gs.getChannelLimits(channel)
+	return &cl
+}
+
 // SetLimits sets limits for this store
 func (gs *genericStore) SetLimits(limits *StoreLimits) error {
 	gs.Lock()
@@ -149,6 +172,30 @@ func (gs *genericStore) SetLimits(limits *StoreLimits) error {
 // CreateChannel implements the Store interface
 func (gs *genericStore) CreateChannel(channel string) (*Channel, error) {
 	return nil, nil
+}
+
+// DeleteChannel implements the Store interface
+func (gs *genericStore) DeleteChannel(channel string) error {
+	gs.Lock()
+	err := gs.deleteChannel(channel)
+	gs.Unlock()
+	return err
+}
+
+func (gs *genericStore) deleteChannel(channel string) error {
+	c := gs.channels[channel]
+	if c == nil {
+		return ErrNotFound
+	}
+	err := c.Msgs.Close()
+	if lerr := c.Subs.Close(); lerr != nil && err == nil {
+		err = lerr
+	}
+	if err != nil {
+		return err
+	}
+	delete(gs.channels, channel)
+	return nil
 }
 
 // canAddChannel returns true if the current number of channels is below the limit.
@@ -165,8 +212,8 @@ func (gs *genericStore) canAddChannel(name string) error {
 }
 
 // AddClient implements the Store interface
-func (gs *genericStore) AddClient(clientID, hbInbox string) (*Client, error) {
-	return &Client{spb.ClientInfo{ID: clientID, HbInbox: hbInbox}}, nil
+func (gs *genericStore) AddClient(info *spb.ClientInfo) (*Client, error) {
+	return &Client{*info}, nil
 }
 
 // DeleteClient implements the Store interface
@@ -214,25 +261,6 @@ func (gms *genericMsgStore) init(subject string, log logger.Logger, limits *MsgS
 	gms.log = log
 }
 
-// createMsg creates a MsgProto with the given sequence number.
-// A timestamp is assigned with the guarantee that it will be at least
-// same than the previous message. That is, given that M1 is stored
-// before M2, this ensures that:
-// M1.Sequence<M2.Sequence && M1.Timestamp <= M2.Timestamp
-func (gms *genericMsgStore) createMsg(seq uint64, data []byte) *pb.MsgProto {
-	m := &pb.MsgProto{
-		Sequence:  seq,
-		Subject:   gms.subject,
-		Data:      data,
-		Timestamp: time.Now().UnixNano(),
-	}
-	if gms.lTimestamp > 0 && m.Timestamp < gms.lTimestamp {
-		m.Timestamp = gms.lTimestamp
-	}
-	gms.lTimestamp = m.Timestamp
-	return m
-}
-
 // State returns some statistics related to this store
 func (gms *genericMsgStore) State() (numMessages int, byteSize uint64, err error) {
 	gms.RLock()
@@ -242,7 +270,7 @@ func (gms *genericMsgStore) State() (numMessages int, byteSize uint64, err error
 }
 
 // Store implements the MsgStore interface
-func (gms *genericMsgStore) Store(data []byte) (uint64, error) {
+func (gms *genericMsgStore) Store(msg *pb.MsgProto) (uint64, error) {
 	// no-op
 	return 0, nil
 }
@@ -296,9 +324,29 @@ func (gms *genericMsgStore) GetSequenceFromTimestamp(timestamp int64) (uint64, e
 	return 0, nil
 }
 
+// Empty implements the MsgStore interface
+func (gms *genericMsgStore) Empty() error {
+	return nil
+}
+
+func (gms *genericMsgStore) empty() {
+	gms.first, gms.last, gms.totalCount, gms.totalBytes, gms.hitLimit = 0, 0, 0, 0, false
+}
+
 // Close closes this store.
 func (gms *genericMsgStore) Close() error {
 	return nil
+}
+
+// With the given timestamp, returns in how long the message
+// should expire. If in the past, returns 0
+func (gms *genericMsgStore) msgExpireIn(timestamp int64) time.Duration {
+	now := time.Now().UnixNano()
+	fireIn := time.Duration(timestamp + int64(gms.limits.MaxAge) - now)
+	if fireIn < 0 {
+		fireIn = 0
+	}
+	return fireIn
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -317,7 +365,7 @@ func (gss *genericSubStore) init(log logger.Logger, limits *SubStoreLimits) {
 // by the other SubStore methods.
 func (gss *genericSubStore) CreateSub(sub *spb.SubState) error {
 	gss.Lock()
-	err := gss.createSubLocked(sub)
+	err := gss.createSub(sub)
 	gss.Unlock()
 	return err
 }
@@ -327,10 +375,10 @@ func (gss *genericSubStore) UpdateSub(sub *spb.SubState) error {
 	return nil
 }
 
-// createSubLocked checks that the number of subscriptions is below the max
+// createSub checks that the number of subscriptions is below the max
 // and if so, assigns a new subscription ID and keep track of it in a map.
 // Lock is assumed to be held on entry.
-func (gss *genericSubStore) createSubLocked(sub *spb.SubState) error {
+func (gss *genericSubStore) createSub(sub *spb.SubState) error {
 	if gss.limits.MaxSubscriptions > 0 && len(gss.subs) >= gss.limits.MaxSubscriptions {
 		return ErrTooManySubs
 	}

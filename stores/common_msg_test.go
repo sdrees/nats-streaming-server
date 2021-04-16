@@ -1,14 +1,50 @@
-// Copyright 2016-2017 Apcera Inc. All rights reserved.
+// Copyright 2016-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package stores
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/stan.go/pb"
 )
+
+func getCryptoOverhead(s MsgStore) uint64 {
+	if cms, ok := s.(*CryptoMsgStore); ok {
+		cms.Lock()
+		overhead := 1 + cms.eds.nonceSize + cms.eds.cryptoOverhead
+		cms.Unlock()
+		return uint64(overhead)
+	}
+	return 0
+}
+
+func getMemMsgStore(ms MsgStore) *MemoryMsgStore {
+	if cms, ok := ms.(*CryptoMsgStore); ok {
+		return cms.MsgStore.(*MemoryMsgStore)
+	}
+	return ms.(*MemoryMsgStore)
+}
+
+func getFileMsgStore(ms MsgStore) *FileMsgStore {
+	if cms, ok := ms.(*CryptoMsgStore); ok {
+		return cms.MsgStore.(*FileMsgStore)
+	}
+	return ms.(*FileMsgStore)
+}
 
 func TestCSBasicMsgStore(t *testing.T) {
 	for _, st := range testStores {
@@ -44,10 +80,10 @@ func TestCSBasicMsgStore(t *testing.T) {
 			}
 
 			payload1 := []byte("m1")
-			m1 := storeMsg(t, cs, "foo", payload1)
+			m1 := storeMsg(t, cs, "foo", 1, payload1)
 
 			payload2 := []byte("m2")
-			m2 := storeMsg(t, cs, "foo", payload2)
+			m2 := storeMsg(t, cs, "foo", 2, payload2)
 
 			if string(payload1) != string(m1.Data) {
 				t.Fatalf("Unexpected payload: %v", string(m1.Data))
@@ -93,16 +129,17 @@ func TestCSBasicMsgStore(t *testing.T) {
 				t.Fatalf("Unexpected error getting state: %v", err)
 			}
 			expectedBytes := uint64(m1.Size() + m2.Size())
-			if _, ok := s.(*FileStore); ok {
+			if isStorageBasedOnFile(s) {
 				// FileStore counts more toward the number of bytes
 				expectedBytes += 2 * (msgRecordOverhead)
 			}
+			expectedBytes += 2 * getCryptoOverhead(ms)
 			if count != 2 || bytes != expectedBytes {
 				t.Fatalf("Unexpected counts: %v, %v vs %v, %v", count, bytes, 2, expectedBytes)
 			}
 
 			// Store one more mesasge to check that LastMsg is correctly updated
-			m3 := storeMsg(t, cs, "foo", []byte("last"))
+			m3 := storeMsg(t, cs, "foo", 3, []byte("last"))
 			lastMsg = msgStoreLastMsg(t, ms)
 			if !reflect.DeepEqual(lastMsg, m3) {
 				t.Fatalf("Expected last message to be %v, got %v", m3, lastMsg)
@@ -125,16 +162,17 @@ func TestCSMsgsState(t *testing.T) {
 			cs1 := storeCreateChannel(t, s, "foo")
 			cs2 := storeCreateChannel(t, s, "bar")
 
-			m1 := storeMsg(t, cs1, "foo", payload)
-			m2 := storeMsg(t, cs2, "bar", payload)
+			m1 := storeMsg(t, cs1, "foo", 1, payload)
+			m2 := storeMsg(t, cs2, "bar", 1, payload)
 
-			_, isFileStore := s.(*FileStore)
+			isFileStore := isStorageBasedOnFile(s)
 
 			count, bytes := msgStoreState(t, cs1.Msgs)
 			expectedBytes := uint64(m1.Size())
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
 			}
+			expectedBytes += getCryptoOverhead(cs1.Msgs)
 			if count != 1 || bytes != expectedBytes {
 				t.Fatalf("Unexpected counts: count=%v vs %v - bytes=%v vs %v", count, 1, bytes, expectedBytes)
 			}
@@ -144,6 +182,7 @@ func TestCSMsgsState(t *testing.T) {
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
 			}
+			expectedBytes += getCryptoOverhead(cs2.Msgs)
 			if count != 1 || bytes != expectedBytes {
 				t.Fatalf("Unexpected counts: count=%v vs %v - bytes=%v vs %v", count, 1, bytes, expectedBytes)
 			}
@@ -160,9 +199,11 @@ func TestCSMaxMsgs(t *testing.T) {
 			s := startTest(t, st)
 			defer s.Close()
 
+			oc := storeCreateChannel(t, s, "overhead")
+
 			payload := []byte("hello")
 
-			_, isFileStore := s.(*FileStore)
+			isFileStore := isStorageBasedOnFile(s)
 
 			limitCount := 0
 			stopBytes := uint64(500)
@@ -174,6 +215,7 @@ func TestCSMaxMsgs(t *testing.T) {
 				if isFileStore {
 					expectedBytes += msgRecordOverhead
 				}
+				expectedBytes += getCryptoOverhead(oc.Msgs)
 				limitCount++
 				if expectedBytes >= stopBytes {
 					break
@@ -193,7 +235,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			cs := storeCreateChannel(t, s, "foo")
 
 			for i := 0; i < totalSent; i++ {
-				storeMsg(t, cs, "foo", payload)
+				storeMsg(t, cs, "foo", uint64(i+1), payload)
 			}
 
 			count, bytes := msgStoreState(t, cs.Msgs)
@@ -223,11 +265,12 @@ func TestCSMaxMsgs(t *testing.T) {
 			// Make sure that the message is stored, but all others should
 			// be removed.
 			bigMsg := make([]byte, limits.MaxBytes+100)
-			m := storeMsg(t, cs, "foo", bigMsg)
+			m := storeMsg(t, cs, "foo", uint64(totalSent+1), bigMsg)
 			expectedBytes = uint64(m.Size())
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
 			}
+			expectedBytes += getCryptoOverhead(cs.Msgs)
 
 			count, bytes = msgStoreState(t, cs.Msgs)
 			if count != 1 || bytes != expectedBytes {
@@ -245,6 +288,7 @@ func TestCSMaxMsgs(t *testing.T) {
 				if isFileStore {
 					expectedBytes += msgRecordOverhead
 				}
+				expectedBytes += getCryptoOverhead(cs.Msgs)
 			}
 			limits.MaxMsgs = expectedCount
 			limits.MaxBytes = 0
@@ -253,7 +297,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			}
 			cs = storeCreateChannel(t, s, channelName)
 			for i := 0; i < expectedCount+10; i++ {
-				storeMsg(t, cs, channelName, payload)
+				storeMsg(t, cs, channelName, uint64(i+1), payload)
 			}
 			n, b := msgStoreState(t, cs.Msgs)
 			if n != expectedCount {
@@ -273,6 +317,7 @@ func TestCSMaxMsgs(t *testing.T) {
 				if isFileStore {
 					expectedBytes += msgRecordOverhead
 				}
+				expectedBytes += getCryptoOverhead(cs.Msgs)
 				expectedCount++
 				if expectedBytes >= 1000 {
 					break
@@ -285,7 +330,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			}
 			cs = storeCreateChannel(t, s, channelName)
 			for i := 0; i < expectedCount+10; i++ {
-				storeMsg(t, cs, channelName, payload)
+				storeMsg(t, cs, channelName, uint64(i+1), payload)
 			}
 			n, b = msgStoreState(t, cs.Msgs)
 			if n != expectedCount {
@@ -308,47 +353,177 @@ func TestCSMaxAge(t *testing.T) {
 			defer s.Close()
 
 			sl := testDefaultStoreLimits
-			sl.MaxAge = 250 * time.Millisecond
+			sl.MaxAge = 500 * time.Millisecond
 			s.SetLimits(&sl)
 
 			cs := storeCreateChannel(t, s, "foo")
 			msg := []byte("hello")
+			seq := uint64(1)
 			for i := 0; i < 10; i++ {
-				storeMsg(t, cs, "foo", msg)
+				storeMsg(t, cs, "foo", seq, msg)
+				seq++
 			}
 			// Wait a bit
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 			// Send more
+			start := time.Now()
 			for i := 0; i < 5; i++ {
-				storeMsg(t, cs, "foo", msg)
+				storeMsg(t, cs, "foo", seq, msg)
+				seq++
 			}
 			// Wait a bit
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 			// We should have the first 10 expired and 5 left.
 			expectedFirst := uint64(11)
 			expectedLast := uint64(15)
 			first, last := msgStoreFirstAndLastSequence(t, cs.Msgs)
-			if first != expectedFirst || last != expectedLast {
+			// On travis, sometimes it gets delayed so much that
+			// by the time we check, all have expired.
+			if dur := time.Since(start); dur >= 350*time.Millisecond {
+				t.Logf("Skipping first/last check since %v passed since sending the 5 msgs", dur)
+			} else if first != expectedFirst || last != expectedLast {
 				t.Fatalf("Expected first/last to be %v/%v, got %v/%v",
 					expectedFirst, expectedLast, first, last)
 			}
 			// Wait more and all should be gone.
-			time.Sleep(sl.MaxAge)
+			time.Sleep(250 * time.Millisecond)
 			if n, _ := msgStoreState(t, cs.Msgs); n != 0 {
 				t.Fatalf("All messages should have expired, got %v", n)
 			}
+
+			// We are going to set a limit of MaxMsgs to 1 on top
+			// of the expiration and make sure that expiration works
+			// ok if first message that was supposed to expire is
+			// gone by the time it should have expired.
+			sl.MaxMsgs = 1
+			s.SetLimits(&sl)
+
+			cs = storeCreateChannel(t, s, "bar")
+			seq = 1
+			storeMsg(t, cs, "bar", seq, msg)
+			seq++
+			// Wait a bit
+			time.Sleep(300 * time.Millisecond)
+			// Send another message that should replace the first one
+			m2 := storeMsg(t, cs, "bar", seq, msg)
+			seq++
+			// Wait more so that max age of initial message is passed
+			time.Sleep(300 * time.Millisecond)
+			// Ensure there is still 1 message...
+			if n, _ := msgStoreState(t, cs.Msgs); n != 1 {
+				t.Fatalf("There should be 1 message, got %v", n)
+			}
+			// ...which should be m2: this should not fail
+			msgStoreLookup(t, cs.Msgs, m2.Sequence)
+			// Again, wait more and second message should not be gone
+			time.Sleep(300 * time.Millisecond)
+			timeout := time.Now().Add(2 * time.Second)
+			ok := false
+			for time.Now().Before(timeout) {
+				if n, _ := msgStoreState(t, cs.Msgs); n != 0 {
+					time.Sleep(15 * time.Millisecond)
+				} else {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				n, _ := msgStoreState(t, cs.Msgs)
+				t.Fatalf("All messages should have expired, got %v", n)
+			}
+
 			if st.name == TypeMemory {
-				// Store a message
-				storeMsg(t, cs, "foo", []byte("msg"))
 				// Verify timer is set
-				ms := s.(*MemoryStore)
-				ms.RLock()
-				timerSet := cs.Msgs.(*MemoryMsgStore).ageTimer != nil
-				ms.RUnlock()
-				if !timerSet {
+				isSet := func() bool {
+					var timerSet bool
+					ms := getMemMsgStore(cs.Msgs)
+					ms.RLock()
+					timerSet = ms.ageTimer != nil
+					ms.RUnlock()
+					return timerSet
+				}
+				if isSet() {
+					t.Fatal("Timer should not be set")
+				}
+				// Store a message
+				storeMsg(t, cs, "bar", seq, []byte("msg"))
+				// Now timer should have been set again
+				if !isSet() {
 					t.Fatal("Timer should have been set")
 				}
+			}
+		})
+	}
+}
 
+func TestCSMaxAgeWithGapInSeq(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			sl := testDefaultStoreLimits
+			sl.MaxAge = 100 * time.Millisecond
+			s.SetLimits(&sl)
+
+			cs := storeCreateChannel(t, s, "foo")
+			msg := []byte("hello")
+			seq := uint64(1)
+			for i := 0; i < 10; i++ {
+				storeMsg(t, cs, "foo", seq, msg)
+				seq++
+			}
+			// Create a gap
+			seq += 10
+			for i := 0; i < 10; i++ {
+				storeMsg(t, cs, "foo", seq, msg)
+				seq++
+			}
+
+			// Wait for more than expiration
+			time.Sleep(200 * time.Millisecond)
+			// They all should be gone.
+			if n, _ := msgStoreState(t, cs.Msgs); n != 0 {
+				t.Fatalf("All messages should have expired, got %v", n)
+			}
+		})
+	}
+}
+
+func TestCSMaxAgeForMsgsWithTimestampInPast(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			sl := testDefaultStoreLimits
+			sl.MaxAge = time.Minute
+			s.SetLimits(&sl)
+
+			cs := storeCreateChannel(t, s, "foo")
+			for seq := uint64(1); seq < 3; seq++ {
+				// Create a message with a timestamp in the past.
+				msg := &pb.MsgProto{
+					Sequence:  seq,
+					Subject:   "foo",
+					Data:      []byte("hello"),
+					Timestamp: time.Now().Add(-time.Hour).UnixNano(),
+				}
+				if _, err := cs.Msgs.Store(msg); err != nil {
+					t.Fatalf("Error storing message: %v", err)
+				}
+				// Wait a bit
+				time.Sleep(300 * time.Millisecond)
+				// Check that message has expired.
+				if first, err := cs.Msgs.FirstSequence(); err != nil || first != seq+1 {
+					t.Fatal("Message should have expired")
+				}
 			}
 		})
 	}
@@ -364,7 +539,7 @@ func TestCSGetSeqFromStartTime(t *testing.T) {
 			defer s.Close()
 
 			limits := testDefaultStoreLimits
-			limits.MaxAge = 500 * time.Millisecond
+			limits.MaxAge = 1500 * time.Millisecond
 			s.SetLimits(&limits)
 			// Force creation of channel without storing anything yet
 			cs := storeCreateChannel(t, s, "foo")
@@ -374,13 +549,13 @@ func TestCSGetSeqFromStartTime(t *testing.T) {
 				t.Fatalf("Invalid start sequence. Expected %v got %v", 0, seq)
 			}
 
-			count := 100
+			count := 50
 			msgs := make([]*pb.MsgProto, 0, count)
 			payload := []byte("hello")
 			for i := 0; i < count; i++ {
-				m := storeMsg(t, cs, "foo", payload)
+				m := storeMsg(t, cs, "foo", uint64(i+1), payload)
 				msgs = append(msgs, m)
-				time.Sleep(1 * time.Millisecond)
+				time.Sleep(10 * time.Millisecond)
 			}
 
 			startMsg := msgs[count/2]
@@ -396,6 +571,19 @@ func TestCSGetSeqFromStartTime(t *testing.T) {
 			if seq != msgs[count-1].Sequence+1 {
 				t.Fatalf("Expected seq to be %v, got %v", msgs[count-1].Sequence+1, seq)
 			}
+
+			lastMsg := msgs[len(msgs)-1]
+			seq = msgStoreGetSequenceFromTimestamp(t, cs.Msgs, lastMsg.Timestamp)
+			if seq != lastMsg.Sequence {
+				t.Fatalf("Invalid last sequence. Expected %v got %v", lastMsg.Sequence, seq)
+			}
+
+			firstMsg := msgs[0]
+			seq = msgStoreGetSequenceFromTimestamp(t, cs.Msgs, firstMsg.Timestamp)
+			if seq != firstMsg.Sequence {
+				t.Fatalf("Invalid first sequence. Expected %v got %v", firstMsg.Sequence, seq)
+			}
+
 			// Wait for all messages to expire
 			deadline := time.Now().Add(2 * time.Second)
 			var n int
@@ -417,16 +605,16 @@ func TestCSGetSeqFromStartTime(t *testing.T) {
 			}
 
 			if st.recoverable {
-				// Restart the server, make sure we can get the expected sequence
+				// Restart the store, make sure we can get the expected sequence
 				times := []int64{
 					time.Now().UnixNano() - int64(time.Hour),
 					time.Now().UnixNano() + int64(time.Hour),
 				}
-				expectedSeqs := []uint64{1, 101}
+				expectedSeqs := []uint64{51, 51}
 
 				for i := 0; i < len(times); i++ {
 					s.Close()
-					s, state := testReOpenStore(t, st, nil)
+					s, state := testReOpenStore(t, st, &limits)
 					defer s.Close()
 
 					cs := getRecoveredChannel(t, state, "foo")
@@ -457,8 +645,8 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 
 			msg := []byte("msg")
 			cs := storeCreateChannel(t, s, "foo")
-			storeMsg(t, cs, "foo", msg)
-			storeMsg(t, cs, "foo", msg)
+			storeMsg(t, cs, "foo", 1, msg)
+			storeMsg(t, cs, "foo", 2, msg)
 
 			if m := msgStoreFirstMsg(t, cs.Msgs); m.Sequence != 1 {
 				t.Fatalf("Unexpected first message: %v", m)
@@ -487,17 +675,24 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 			getInternalFirstAndLastMsg := func() {
 				switch st.name {
 				case TypeMemory:
-					ms := cs.Msgs.(*MemoryMsgStore)
+					ms := getMemMsgStore(cs.Msgs)
 					ms.RLock()
 					firstMsg = ms.msgs[ms.first]
 					lastMsg = ms.msgs[ms.last]
 					ms.RUnlock()
 				case TypeFile:
-					ms := cs.Msgs.(*FileMsgStore)
+					fallthrough
+				case TypeRaft:
+					ms := getFileMsgStore(cs.Msgs)
 					ms.RLock()
 					firstMsg = ms.firstMsg
 					lastMsg = ms.lastMsg
 					ms.RUnlock()
+				case TypeSQL:
+					// Not applicable since this store does not store
+					// the first and last message.
+					firstMsg = msgStoreFirstMsg(t, cs.Msgs)
+					lastMsg = msgStoreLastMsg(t, cs.Msgs)
 				default:
 					stackFatalf(t, "Fix test for store type: %v", st.name)
 				}
@@ -511,8 +706,8 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 				t.Fatalf("Unexpected last message: %v", lastMsg)
 			}
 			// Store two new messages and check first/last updated correctly
-			storeMsg(t, cs, "foo", msg)
-			storeMsg(t, cs, "foo", msg)
+			storeMsg(t, cs, "foo", 3, msg)
+			storeMsg(t, cs, "foo", 4, msg)
 
 			getInternalFirstAndLastMsg()
 			if firstMsg == nil || firstMsg.Sequence != 3 {
@@ -522,6 +717,170 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 				t.Fatalf("Unexpected last message: %v", lastMsg)
 			}
 
+		})
+	}
+}
+
+func TestCSLimitsOnRecovery(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			if !st.recoverable {
+				return
+			}
+			t.Parallel()
+			defer endTest(t, st)
+
+			storeMsgs := func(cs *Channel, count, size int) {
+				msg := make([]byte, size)
+				for i := 0; i < count; i++ {
+					storeMsg(t, cs, "foo", uint64(i+1), msg)
+				}
+			}
+
+			// First run store with no limit.
+			s := startTest(t, st)
+			defer s.Close()
+			cs := storeCreateChannel(t, s, "foo")
+			storeMsgs(cs, 1, 10)
+			s.Close()
+
+			// Add limit of MaxAge
+			limits := testDefaultStoreLimits
+			limits.MaxAge = 15 * time.Millisecond
+			// Wait more than max age
+			time.Sleep(30 * time.Millisecond)
+			// Reopen store
+			s, state := testReOpenStore(t, st, &limits)
+			cs = state.Channels["foo"].Channel
+			// Message should be gone.
+			if n, _ := msgStoreState(t, cs.Msgs); n != 0 {
+				t.Fatalf("Expected no message, got %v", n)
+			}
+			s.Close()
+
+			// Remove MaxAge
+			limits.MaxAge = time.Duration(0)
+			s, state = testReOpenStore(t, st, &limits)
+			cs = state.Channels["foo"].Channel
+			// Store 3 messages. We will set the limit to 2 on restart.
+			storeMsgs(cs, 3, 10)
+			s.Close()
+			limits.MaxMsgs = 2
+			s, state = testReOpenStore(t, st, &limits)
+			cs = state.Channels["foo"].Channel
+			if n, _ := msgStoreState(t, cs.Msgs); n != limits.MaxMsgs {
+				t.Fatalf("Expected %d messages, got %v", limits.MaxMsgs, n)
+			}
+			s.Close()
+
+			// Remove MaxMsgs
+			limits.MaxMsgs = 0
+			s, state = testReOpenStore(t, st, &limits)
+			cs = state.Channels["foo"].Channel
+			// Send more about 1000 bytes, we will set the limit to 500
+			storeMsgs(cs, 10, 100)
+			s.Close()
+			limits.MaxBytes = 500
+			s, state = testReOpenStore(t, st, &limits)
+			cs = state.Channels["foo"].Channel
+			if _, n := msgStoreState(t, cs.Msgs); n > uint64(limits.MaxBytes) {
+				t.Fatalf("Expected bytes less than %v, got %v", limits.MaxBytes, n)
+			}
+			s.Close()
+		})
+	}
+}
+
+func TestCSMsgStoreEmpty(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+
+			s := startTest(t, st)
+			defer s.Close()
+
+			limits := &StoreLimits{}
+			limits.MaxAge = 500 * time.Millisecond
+			s.SetLimits(limits)
+
+			cs := storeCreateChannel(t, s, "foo")
+			for i := 0; i < 10; i++ {
+				storeMsg(t, cs, "foo", uint64(i+1), []byte(fmt.Sprintf("msg%d", (i+1))))
+			}
+
+			first, last := msgStoreFirstAndLastSequence(t, cs.Msgs)
+			if first != 1 || last != 10 {
+				t.Fatalf("Expected first to be 1 and last to be 10, got %v and %v", first, last)
+			}
+			firstMsg := msgStoreFirstMsg(t, cs.Msgs)
+			if firstMsg.Sequence != 1 {
+				t.Fatalf("Expected first message sequence to be 1, got %v", firstMsg.Sequence)
+			}
+			if !reflect.DeepEqual(firstMsg.Data, []byte("msg1")) {
+				t.Fatalf("Expected first message data to be msg1, got %s", firstMsg.Data)
+			}
+			lastMsg := msgStoreLastMsg(t, cs.Msgs)
+			if lastMsg.Sequence != 10 {
+				t.Fatalf("Expected last message sequence to be 10, got %v", lastMsg.Sequence)
+			}
+			if !reflect.DeepEqual(lastMsg.Data, []byte("msg10")) {
+				t.Fatalf("Expected last message data to be msg10, got %s", lastMsg.Data)
+			}
+			count, size := msgStoreState(t, cs.Msgs)
+			if count != 10 || size == 0 {
+				t.Fatalf("Unexpected count and size: %v and %v", count, size)
+			}
+
+			if err := cs.Msgs.Empty(); err != nil {
+				t.Fatalf("Error on Empty(): %v", err)
+			}
+			// Check that we can't lookup existing messages
+			for i := 0; i < 10; i++ {
+				if m, _ := cs.Msgs.Lookup(uint64(i + 1)); m != nil {
+					t.Fatalf("Should not have been able to lookup msg seq=%v, got %v", i+1, m)
+				}
+			}
+
+			count, size = msgStoreState(t, cs.Msgs)
+			if count != 0 || size != 0 {
+				t.Fatalf("Unexpected count and size: %v and %v", count, size)
+			}
+			first, last = msgStoreFirstAndLastSequence(t, cs.Msgs)
+			if first != 0 || last != 0 {
+				t.Fatalf("Expected first and last to be 0, got %v and %v", first, last)
+			}
+			firstMsg = msgStoreFirstMsg(t, cs.Msgs)
+			if firstMsg != nil {
+				t.Fatalf("Expected no first message, got %v", firstMsg)
+			}
+			lastMsg = msgStoreLastMsg(t, cs.Msgs)
+			if lastMsg != nil {
+				t.Fatalf("Expected no last message, got %v", lastMsg)
+			}
+
+			// Wait past message expiration and ensure that we don't crash.
+			time.Sleep(750 * time.Millisecond)
+
+			// Add a new message
+			storeMsg(t, cs, "foo", 20, []byte("msg20"))
+			first, last = msgStoreFirstAndLastSequence(t, cs.Msgs)
+			if first != 20 || last != 20 {
+				t.Fatalf("Expected first and last to be 20, got %v and %v", first, last)
+			}
+			firstMsg = msgStoreFirstMsg(t, cs.Msgs)
+			if firstMsg.Sequence != 20 {
+				t.Fatalf("Expected first message sequence to be 20, got %v", firstMsg.Sequence)
+			}
+			if !reflect.DeepEqual(firstMsg.Data, []byte("msg20")) {
+				t.Fatalf("Expected first message data to be msg1, got %s", firstMsg.Data)
+			}
+			lastMsg = msgStoreLastMsg(t, cs.Msgs)
+			if !reflect.DeepEqual(firstMsg, lastMsg) {
+				t.Fatalf("Expected first and last message to be the same, got %v and %v", firstMsg, lastMsg)
+			}
 		})
 	}
 }
