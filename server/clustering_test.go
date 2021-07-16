@@ -569,6 +569,7 @@ func TestClusteringBootstrapMisconfiguration(t *testing.T) {
 	n1Opts := natsdTest.DefaultTestOptions
 	n1Opts.Host = "127.0.0.1"
 	n1Opts.Port = 4222
+	n1Opts.Cluster.Name = "abc"
 	n1Opts.Cluster.Host = "127.0.0.1"
 	n1Opts.Cluster.Port = 6222
 	n1Opts.Routes = natsd.RoutesFromStr("nats://127.0.0.1:6223")
@@ -587,6 +588,7 @@ func TestClusteringBootstrapMisconfiguration(t *testing.T) {
 	n2Opts := natsdTest.DefaultTestOptions
 	n2Opts.Host = "127.0.0.1"
 	n2Opts.Port = 4223
+	n2Opts.Cluster.Name = "abc"
 	n2Opts.Cluster.Host = "127.0.0.1"
 	n2Opts.Cluster.Port = 6223
 	s2sOpts := getTestDefaultOptsForClustering("b", true)
@@ -4844,6 +4846,7 @@ func TestClusteringNoPanicOnChannelDelete(t *testing.T) {
 	// For this test, we need 2 NATS Servers
 	do := natsdTest.DefaultTestOptions
 	ns1Opts := do.Clone()
+	ns1Opts.Cluster.Name = "abc"
 	ns1Opts.Cluster.Host = "127.0.0.1"
 	ns1Opts.Cluster.Port = -1
 	ns1 := natsdTest.RunServer(ns1Opts)
@@ -4861,6 +4864,7 @@ func TestClusteringNoPanicOnChannelDelete(t *testing.T) {
 
 	ns2Opts := do.Clone()
 	ns2Opts.Port = 4223
+	ns2Opts.Cluster.Name = "abc"
 	ns2Opts.Cluster.Host = "127.0.0.1"
 	ns2Opts.Cluster.Port = -1
 	ns2Opts.Routes = natsd.RoutesFromStr(proxy.getAddr())
@@ -7041,6 +7045,88 @@ func TestClusteringQueueMemberPendingCount(t *testing.T) {
 	})
 }
 
+func TestClusteringQueueMemberStalled(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	// Configure second server.
+	s3sOpts := getTestDefaultOptsForClustering("c", false)
+	s3 := runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	getLeader(t, 10*time.Second, s1, s2, s3)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	ch := make(chan struct{}, 1)
+	if _, err := sc.QueueSubscribe("foo", "bar",
+		func(m *stan.Msg) {
+			// Don't ack the message. This member should be stalled right away
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		},
+		stan.DurableName("dur"),
+		stan.SetManualAckMode(),
+		stan.MaxInflight(1)); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	count := int32(0)
+	if _, err := sc.QueueSubscribe("foo", "bar",
+		func(m *stan.Msg) {
+			if string(m.Data) == "count_now" {
+				atomic.AddInt32(&count, 1)
+			}
+			m.Ack()
+		},
+		stan.DurableName("dur"),
+		stan.SetManualAckMode(),
+		stan.MaxInflight(10)); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Publish messages until we know that the queue member that stalls got a message.
+	for done := false; !done; {
+		sc.Publish("foo", []byte("msg"))
+		select {
+		case <-ch:
+			done = true
+		default:
+		}
+	}
+
+	// Now publish 10 messages asking the queue member 2 to count those.
+	for i := 0; i < 10; i++ {
+		sc.Publish("foo", []byte("count_now"))
+	}
+	// Make sure that those were received by the non-stalled queue member
+	waitFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+		if n := atomic.LoadInt32(&count); n != 10 {
+			return fmt.Errorf("Did not get all messages: %v", n)
+		}
+		return nil
+	})
+}
+
 type captureRaftLogger struct {
 	dummyLogger
 	good map[string]struct{}
@@ -7248,6 +7334,7 @@ func TestClusteringRestoreSnapshotGapInSeq(t *testing.T) {
 	n1Opts := natsdTest.DefaultTestOptions
 	n1Opts.Host = "127.0.0.1"
 	n1Opts.Port = 4222
+	n1Opts.Cluster.Name = "abc"
 	n1Opts.Cluster.Host = "127.0.0.1"
 	n1Opts.Cluster.Port = 6222
 	ns1 := natsdTest.RunServer(&n1Opts)
@@ -7256,6 +7343,7 @@ func TestClusteringRestoreSnapshotGapInSeq(t *testing.T) {
 	n2Opts := natsdTest.DefaultTestOptions
 	n2Opts.Host = "127.0.0.1"
 	n2Opts.Port = 4223
+	n2Opts.Cluster.Name = "abc"
 	n2Opts.Cluster.Host = "127.0.0.1"
 	n2Opts.Cluster.Port = 6223
 	n2Opts.Routes = natsd.RoutesFromStr("nats://127.0.0.1:6222")
@@ -7265,6 +7353,7 @@ func TestClusteringRestoreSnapshotGapInSeq(t *testing.T) {
 	n3Opts := natsdTest.DefaultTestOptions
 	n3Opts.Host = "127.0.0.1"
 	n3Opts.Port = 4224
+	n3Opts.Cluster.Name = "abc"
 	n3Opts.Cluster.Host = "127.0.0.1"
 	n3Opts.Cluster.Port = 6224
 	n3Opts.Routes = natsd.RoutesFromStr("nats://127.0.0.1:6222, nats://127.0.0.1:6223")
@@ -7512,6 +7601,7 @@ func TestClusteringSubStateProperlyResetOnLeadershipAcquired(t *testing.T) {
 	// when shuting one down.
 	nsAopts := natsdTest.DefaultTestOptions
 	nsAopts.Port = 4222
+	nsAopts.Cluster.Name = "abc"
 	nsAopts.Cluster.Host = "127.0.0.1"
 	nsAopts.Cluster.Port = -1
 	nsAopts.Cluster.NoAdvertise = true
@@ -7520,6 +7610,7 @@ func TestClusteringSubStateProperlyResetOnLeadershipAcquired(t *testing.T) {
 
 	nsBCopts := natsdTest.DefaultTestOptions
 	nsBCopts.Port = 4223
+	nsBCopts.Cluster.Name = "abc"
 	nsBCopts.Cluster.Host = "127.0.0.1"
 	nsBCopts.Cluster.Port = -1
 	nsBCopts.Routes = natsd.RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%v", nsAopts.Cluster.Port))
@@ -7726,7 +7817,7 @@ func TestClusteringRedeliveryCount(t *testing.T) {
 	atomic.StoreInt32(&restarted, 1)
 	s1 = runServerWithOpts(t, s1sOpts, nil)
 	defer s1.Shutdown()
-	getLeader(t, 10*time.Second, s1, s2, s3)
+	leader := getLeader(t, 10*time.Second, s1, s2, s3)
 
 	select {
 	case e := <-errCh:
@@ -7757,6 +7848,15 @@ func TestClusteringRedeliveryCount(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("Timedout")
 	}
+
+	// Make sure that deliver count map gets cleaned-up once messages are acknowledged.
+	sub := leader.clients.getSubs(clientName)[0]
+	waitForCount(t, 0, func() (string, int) {
+		sub.RLock()
+		l := len(sub.rdlvCount)
+		sub.RUnlock()
+		return "redelivery map size", l
+	})
 }
 
 func testRemoveNode(t *testing.T, nc *nats.Conn, node string, timeoutExpected bool) {
@@ -7767,7 +7867,7 @@ func testRemoveNode(t *testing.T, nc *nats.Conn, node string, timeoutExpected bo
 	}
 	resp, err := nc.Request(fmt.Sprintf(removeClusterNodeSubj, clusterName), []byte(node), timeout)
 	if timeoutExpected {
-		if err != nats.ErrTimeout {
+		if err != nats.ErrTimeout && err != nats.ErrNoResponders {
 			t.Fatalf("Expected timeout, got %v", err)
 		}
 		return
@@ -8084,5 +8184,93 @@ func TestClusteringDurableReplaced(t *testing.T) {
 	c.ss.RUnlock()
 	if lenDur != 1 {
 		t.Fatalf("Expected 1 durable, got %v", lenDur)
+	}
+}
+
+func TestClusteringRaceCausesFollowerToRedeliverMsgs(t *testing.T) {
+	testRaceLeaderTransfer = true
+	defer func() { testRaceLeaderTransfer = false }()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.ReplaceDurable = true
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Wait for it to bootstrap
+	getLeader(t, 10*time.Second, s1)
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.ReplaceDurable = true
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	// Configure third server.
+	s3sOpts := getTestDefaultOptsForClustering("c", false)
+	s3sOpts.ReplaceDurable = true
+	s3 := runServerWithOpts(t, s3sOpts, nil)
+	defer s3.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	ch := make(chan bool, 10)
+	errCh := make(chan error, 1)
+	prev := uint32(0)
+	if _, err := sc.Subscribe("foo",
+		func(m *stan.Msg) {
+			if !m.Redelivered {
+				ch <- true
+			} else {
+				if m.RedeliveryCount != prev+1 {
+					select {
+					case errCh <- fmt.Errorf("Received duplicate redelivered msg: %+v", m):
+					default:
+					}
+				}
+				prev = m.RedeliveryCount
+			}
+		},
+		stan.AckWait(ackWaitInMs(500)),
+		stan.DeliverAllAvailable(),
+		stan.DurableName("dur"),
+		stan.SetManualAckMode()); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+
+	// Wait for message to be delivered
+	if err := WaitTime(ch, time.Second); err != nil {
+		t.Fatalf("Did not get message: %v", err)
+	}
+
+	// Stop the leader
+	s1.Shutdown()
+
+	// Wait for new leader
+	leader := getLeader(t, 10*time.Second, s2, s3)
+
+	// Stepdown
+	if err := leader.raft.LeadershipTransfer().Error(); err != nil {
+		t.Fatalf("Error stepping down: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(4 * time.Second):
+		// ok
 	}
 }

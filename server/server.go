@@ -47,7 +47,7 @@ import (
 // Server defaults.
 const (
 	// VERSION is the current version for the NATS Streaming server.
-	VERSION = "0.21.2"
+	VERSION = "0.22.0"
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
@@ -182,6 +182,7 @@ var (
 	lazyReplicationInterval    = defaultLazyReplicationInterval
 	testDeleteChannel          bool
 	testSubSentAndAckSlowApply bool
+	testRaceLeaderTransfer     bool
 )
 
 var (
@@ -2298,10 +2299,7 @@ func (s *StanServer) leadershipAcquired() error {
 		}
 	}
 	if len(allSubs) > 0 {
-		s.startGoRoutine(func() {
-			s.performRedeliveryOnStartup(allSubs)
-			s.wg.Done()
-		})
+		s.performRedeliveryOnStartup(allSubs)
 	}
 
 	if err := s.nc.Flush(); err != nil {
@@ -2481,7 +2479,7 @@ func (s *StanServer) ensureRunningStandAlone() error {
 	req := &pb.ConnectRequest{ClientID: clusterID, HeartbeatInbox: hbInbox}
 	b, _ := req.Marshal()
 	reply, err := s.nc.Request(s.info.Discovery, b, timeout)
-	if err == nats.ErrTimeout {
+	if err == nats.ErrTimeout || err == nats.ErrNoResponders {
 		s.log.Debugf("Did not detect another server instance")
 		return nil
 	}
@@ -2661,6 +2659,9 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 // Redelivers unacknowledged messages, releases the hold for new messages delivery,
 // and kicks delivery of available messages.
 func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
+	if testRaceLeaderTransfer {
+		time.Sleep(time.Second)
+	}
 	queues := make(map[*queueState]*channel)
 
 	for _, sub := range recoveredSubs {
@@ -2673,6 +2674,9 @@ func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
 			sub.newOnHold = false
 			sub.Unlock()
 			continue
+		}
+		if sub.ackTimer == nil {
+			s.setupAckTimer(sub, sub.ackWait)
 		}
 		// Unlock in order to call function below
 		sub.Unlock()
@@ -3689,14 +3693,13 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 	qs := sub.qstate
 	clientID := sub.ClientID
 	subID := sub.ID
-	if sub.ackTimer == nil {
-		s.setupAckTimer(sub, sub.ackWait)
-	}
 	if qs == nil {
 		// If the client has some failed heartbeats, ignore this request.
 		if sub.hasFailedHB {
 			// Reset the timer
-			sub.ackTimer.Reset(sub.ackWait)
+			if s.isStandaloneOrLeader() {
+				sub.ackTimer.Reset(sub.ackWait)
+			}
 			sub.Unlock()
 			if s.debug {
 				s.log.Debugf("[Client:%s] Skipping redelivery to subid=%d due to missed client heartbeat", clientID, subID)
@@ -5428,6 +5431,15 @@ func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64, from
 			return
 		}
 		delete(sub.acksPending, sequence)
+		// Remove from redelivery count map only if processing an ACK from the user,
+		// not simply when reassigning to a new member of a queue group.
+		if fromUser {
+			if qs != nil {
+				delete(qs.rdlvCount, sequence)
+			} else {
+				delete(sub.rdlvCount, sequence)
+			}
+		}
 	} else if qs != nil && fromUser {
 		// For queue members, if this is not an internally generated ACK
 		// and we don't find the sequence in this sub's pending, we are
@@ -5438,13 +5450,19 @@ func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64, from
 				continue
 			}
 			qsub.Lock()
-			if _, found := qsub.acksPending[sequence]; found {
+			_, found := qsub.acksPending[sequence]
+			if found {
 				delete(qsub.acksPending, sequence)
 				persistAck(qsub)
-				qsub.Unlock()
-				break
 			}
 			qsub.Unlock()
+			if found {
+				// We are still under the qstate lock. Since we found this message
+				// in one of the member of the group, remove it from the redelivery
+				// count map now.
+				delete(qs.rdlvCount, sequence)
+				break
+			}
 		}
 		sub.Lock()
 		// Proceed with original sub (regardless if member was found
